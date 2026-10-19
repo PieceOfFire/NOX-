@@ -72,9 +72,9 @@ class FormulaDocument:
         cls, preset: object, integrals: list[dict] = (), comparison_id: int | None = None
     ) -> FormulaDocument:
         if not isinstance(preset, dict) or preset.get("format") != "nmr-formula-preset":
-            raise ValueError("это не пресет формул NOX")
+            raise ValueError("это не формула NOX")
         if not isinstance(preset.get("blocks"), list):
-            raise ValueError("в пресете нет списка блоков")
+            raise ValueError("в формуле нет списка блоков")
         doc = cls(name=str(preset.get("name") or "Расчёт"))
 
         def number(value, default=40.0):
@@ -90,10 +90,10 @@ class FormulaDocument:
                 "operation",
                 "output",
             }:
-                raise ValueError("пресет содержит неизвестный тип блока")
+                raise ValueError("формула содержит неизвестный тип блока")
             bid = int(raw["id"])
             if bid in doc.blocks:
-                raise ValueError("в пресете повторяются номера блоков")
+                raise ValueError("в формуле повторяются номера блоков")
             kind, op = raw["kind"], raw.get("operation")
             if kind == "operation" and op not in OPERATIONS:
                 raise ValueError(f"неизвестная операция: {op}")

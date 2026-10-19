@@ -1,4 +1,4 @@
-"""The everyday calculation interface: choose a preset and read the results."""
+"""The everyday calculation interface: choose a formula and read the results."""
 
 from __future__ import annotations
 
@@ -24,13 +24,13 @@ class CalculationsView(tk.Frame):
         ).pack(anchor="w")
         tk.Label(
             header,
-            text="Выберите готовый пресет — результаты пересчитываются при обработке спектра.",
+            text="Выберите готовую формулу слева — результаты пересчитываются при обработке спектра.",
             font="TkDefaultFont",
             fg=MUTED,
             bg=PAGE,
         ).pack(anchor="w", pady=(6, 0))
         body = tk.PanedWindow(self, orient=tk.HORIZONTAL, bg=PAGE, bd=0, sashwidth=7)
-        library = tk.LabelFrame(body, text="  Пресеты  ", bg=PAGE, padx=8, pady=8)
+        library = tk.LabelFrame(body, text="  Формулы  ", bg=PAGE, padx=8, pady=8)
         right = tk.LabelFrame(body, text="  Результаты  ", bg=PAGE, padx=8, pady=8)
         body.add(library, minsize=235, width=300)
         body.add(right, minsize=360)
@@ -49,8 +49,10 @@ class CalculationsView(tk.Frame):
         tk.Button(buttons, text="Импорт…", command=self.import_presets).pack(side="left")
         tk.Button(buttons, text="Обновить", command=self.reload_library).pack(side="right")
         self.list.pack(fill="both", expand=True)
-        self.title = tk.StringVar(value="Выберите пресет слева")
-        self.description = tk.StringVar(value="Сначала создайте области интегрирования на спектре.")
+        self.title = tk.StringVar(value="Выберите формулу слева")
+        self.description = tk.StringVar(
+            value="Выберите готовую формулу из списка и создайте области интегрирования на спектре."
+        )
         self.inputs = tk.StringVar()
         tk.Label(
             right,
@@ -101,7 +103,7 @@ class CalculationsView(tk.Frame):
         )
         tk.Label(
             right,
-            text="Ctrl+C — копировать выбранные строки. Схема пресета доступна в отдельном редакторе.",
+            text="Ctrl+C — копировать выбранные строки. Формулу можно изменить в отдельном редакторе.",
             font="AppSmallFont",
             bg=PAGE,
             fg=MUTED,
@@ -153,7 +155,7 @@ class CalculationsView(tk.Frame):
 
     def import_presets(self):
         paths = filedialog.askopenfilenames(
-            parent=self, title="Добавить пресеты расчётов", filetypes=(("Пресеты NOX", "*.json"),)
+            parent=self, title="Добавить формулы расчётов", filetypes=(("Формулы NOX", "*.json"),)
         )
         errors, last = [], None
         for path in paths:
@@ -165,16 +167,20 @@ class CalculationsView(tk.Frame):
             self.app.apply_calculation_preset(last.key)
         self.refresh_library()
         if errors:
-            messagebox.showerror("Импорт пресетов", "\n".join(errors), parent=self)
+            messagebox.showerror("Импорт формул", "\n".join(errors), parent=self)
 
     def refresh_results(self):
         doc = self.app.formula_document
-        self.title.set(doc.name if doc.blocks else "Выберите пресет слева")
+        self.title.set(doc.name if doc.blocks else "Выберите формулу слева")
         entry = self.app.preset_library.entries.get(self.app.active_preset_key)
         self.description.set(
             entry.description
             if entry
-            else "Собственный расчёт. Его можно сохранить как пресет в редакторе формул."
+            else (
+                "Собственный расчёт. Его можно сохранить как формулу в редакторе формул."
+                if doc.blocks
+                else "Выберите готовую формулу из списка и создайте области интегрирования на спектре."
+            )
         )
         required = doc.area_numbers()
         available = {int(i["number"]) for i in self.app.formula_source_integrals()}

@@ -18,9 +18,10 @@ from formula_document import FormulaDocument
 from formula_engine import FormulaEngine, format_value
 from processing_templates import apply_template, load_template, make_template
 from report_export import write_report
-from sensitivity import analyze_sensitivity, summarize_sensitivity
+from sensitivity import analyze_sensitivity, sensitivity_case_count, summarize_sensitivity
 from signal_quality import fit_quality, integral_quality
 from spin_backend import current_signal, same_state
+from view_preferences import capture_table_view, restore_table_view
 
 
 class ResultsWindow(tk.Toplevel):
@@ -32,6 +33,9 @@ class ResultsWindow(tk.Toplevel):
         self.stop = threading.Event()
         self.events = queue.Queue()
         self.poll_id = None
+        self.running = False
+        self.progress_last = (0, 0, "")
+        self._table_schema = None
         self.modal = modal
         self.title(title)
         width = min(1120, max(800, self.winfo_screenwidth() - 80))
@@ -46,6 +50,13 @@ class ResultsWindow(tk.Toplevel):
         self.footer = tk.Frame(self, padx=10, pady=8)
         self.footer.pack(side="bottom", fill="x")
         tk.Button(self.footer, text="Закрыть", command=self.destroy).pack(side="right")
+        self.progress_frame = ttk.Frame(self, padding=(10, 4))
+        self.progress = ttk.Progressbar(self.progress_frame, mode="determinate", maximum=1)
+        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.stop_button = ttk.Button(
+            self.progress_frame, text="Остановить", command=self.request_stop, state="disabled"
+        )
+        self.stop_button.pack(side="right")
         self.status = tk.StringVar()
         tk.Label(
             self,
@@ -58,8 +69,16 @@ class ResultsWindow(tk.Toplevel):
         ).pack(side="bottom", fill="x")
         self.options = tk.Frame(self, padx=10, pady=8)
         self.options.pack(fill="x")
-        area = tk.Frame(self, padx=10, pady=5)
-        area.pack(fill="both", expand=True)
+        if plot:
+            self.result_split = tk.PanedWindow(
+                self, orient="vertical", sashwidth=6, showhandle=True, bd=0
+            )
+            self.result_split.pack(fill="both", expand=True)
+        area = tk.Frame(self.result_split if plot else self, padx=10, pady=5)
+        if plot:
+            self.result_split.add(area, minsize=120, height=210, stretch="always")
+        else:
+            area.pack(fill="both", expand=True)
         area.rowconfigure(0, weight=1)
         area.columnconfigure(0, weight=1)
         self.table = ttk.Treeview(
@@ -86,7 +105,9 @@ class ResultsWindow(tk.Toplevel):
         if plot:
             self.figure = Figure(figsize=(8, 3), dpi=100)
             self.axes = self.figure.subplots()
-            self.canvas = FigureCanvasTkAgg(self.figure, self)
+            plot_frame = ttk.Frame(self.result_split)
+            self.result_split.add(plot_frame, minsize=180, stretch="always")
+            self.canvas = FigureCanvasTkAgg(self.figure, plot_frame)
             self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=5)
 
     def copy(self, event):
@@ -102,6 +123,9 @@ class ResultsWindow(tk.Toplevel):
                 return format_value(value) if np.isfinite(value) else "—"
             return value
 
+        schema = tuple((str(c), self.table.heading(c, "text")) for c in self.table.cget("columns"))
+        state = capture_table_view(self.table) if schema == self._table_schema else {}
+        self._table_schema = schema
         self.table.delete(*self.table.get_children())
         for i, row in enumerate(rows):
             self.table.insert(
@@ -110,10 +134,33 @@ class ResultsWindow(tk.Toplevel):
                 iid=str(i),
                 values=[cell(v) for v in row],
             )
+        restore_table_view(self.table, state)
 
-    def start(self, work, done):
-        self.status.set("Вычисление… Можно закрыть окно, чтобы отменить.")
+    def report_progress(self, completed, total, label=""):
+        """Worker-safe: all Tk updates happen later in the GUI poll."""
+        if not self.closed:
+            self.events.put(("progress", (completed, total, str(label))))
+
+    def request_stop(self):
+        if self.running:
+            self.stop.set()
+            self.stop_button.configure(state="disabled")
+            self.status.set(
+                "Остановка… Текущая подгонка безопасно завершится; готовые результаты сохранятся."
+            )
+
+    def start(self, work, done, *, failed=None):
+        if self.running or self.closed:
+            return False
+        self.stop.clear()
+        self.running = True
+        self.progress_last = (0, 0, "")
+        self.progress.configure(maximum=1, value=0)
+        self.progress_frame.pack(side="bottom", fill="x", before=self.options)
+        self.stop_button.configure(state="normal")
+        self.status.set("Вычисление… «Остановить» сохранит готовую часть проверки.")
         self.done = done
+        self.failed = failed
 
         def worker():
             try:
@@ -123,20 +170,48 @@ class ResultsWindow(tk.Toplevel):
 
         threading.Thread(target=worker, daemon=True, name="himera-workflow").start()
         self.poll_id = self.after(80, self.poll)
+        return True
 
     def poll(self):
         if self.closed:
             return
-        try:
-            success, payload = self.events.get_nowait()
-        except queue.Empty:
+        result = None
+        latest = None
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                latest = payload
+            else:
+                result = kind, payload
+                break
+        if latest:
+            completed, total, label = latest
+            total = max(0, int(total))
+            completed = min(total, max(0, int(completed)))
+            self.progress_last = completed, total, label
+            self.progress.configure(maximum=max(1, total), value=completed)
+            if not self.stop.is_set():
+                self.status.set(f"{label} · {completed}/{total}")
+        if result is None:
             self.poll_id = self.after(80, self.poll)
             return
         self.poll_id = None
+        self.running = False
+        self.stop_button.configure(state="disabled")
+        success, payload = result
         if success:
             self.done(payload)
+            if self.stop.is_set() and not self.status.get().startswith("Остановлено"):
+                self.status.set(
+                    "Остановлено. Результаты могут быть неполными. " + self.status.get()
+                )
         else:
             self.status.set("Ошибка: " + payload)
+            if self.failed is not None:
+                self.failed(payload)
 
     def destroy(self):
         if self.closed:
@@ -166,6 +241,9 @@ class WorkflowMixin:
                     label="Контроль качества интегралов…", command=self.open_integral_quality
                 )
                 menu.add_command(
+                    label="Устойчивость интегралов…", command=self.open_integral_stability
+                )
+                menu.add_command(
                     label="Шаблоны обработки серии…", command=self.open_processing_templates
                 )
             elif label == "Расчёты":
@@ -173,6 +251,9 @@ class WorkflowMixin:
                 menu.add_command(label="Оценка устойчивости…", command=self.open_sensitivity)
             elif label == "Файл":
                 menu.add_separator()
+                menu.add_command(
+                    label="Экспорт интегралов в CSV…", command=self.export_integrals_csv
+                )
                 menu.add_command(label="Экспорт отчёта…", command=self.export_analysis_report)
 
     def workflow_available(self):
@@ -390,6 +471,12 @@ class WorkflowMixin:
         refresh()
         return window
 
+    def open_integral_stability(self):
+        # Keep the empty-window startup independent of optional diagnostics.
+        from integral_stability_view import open_integral_stability
+
+        return open_integral_stability(self)
+
     def open_sensitivity(self):
         if not self.workflow_available():
             return
@@ -398,7 +485,8 @@ class WorkflowMixin:
         if not any(b["kind"] == "output" for b in blocks.values()):
             messagebox.showinfo(
                 "Устойчивость",
-                "Выберите расчётный пресет или добавьте вывод в формуле.",
+                "Выберите готовую формулу или добавьте вывод в редакторе формул.\n"
+                "Для проверки самих интегралов без формулы: Обработка сигналов → Устойчивость интегралов…",
                 parent=self,
             )
             return
@@ -434,21 +522,54 @@ class WorkflowMixin:
 
             def work(stop):
                 rows = []
-                for record in records:
+                total = sum(sensitivity_case_count(r, contexts[r["id"]]) for r in records)
+                completed = 0
+                for index, record in enumerate(records, 1):
                     if stop.is_set():
-                        return []
-                    result = analyze_sensitivity(
-                        record,
-                        blocks,
-                        contexts[record["id"]],
-                        delta=d,
-                        baseline_percent=p,
-                        absolute=absolute,
-                        stop=stop,
-                    )
+                        break
+
+                    def progress(count, _planned, label):
+                        window.report_progress(
+                            completed + count,
+                            total,
+                            f"Спектр {index}/{len(records)} · {record['name']} · {label}",
+                        )
+
+                    try:
+                        result = analyze_sensitivity(
+                            record,
+                            blocks,
+                            contexts[record["id"]],
+                            delta=d,
+                            baseline_percent=p,
+                            absolute=absolute,
+                            stop=stop,
+                            progress=progress,
+                            keep_partial=True,
+                        )
+                    except Exception as error:
+                        # One damaged spectrum must not erase completed checks
+                        # from earlier spectra, or look like a valid zero output.
+                        result = [
+                            dict(
+                                case="Исходный",
+                                output_id=bid,
+                                name=block.get("name") or "Вывод",
+                                value=None,
+                                status="error",
+                                message=str(error),
+                                planned_cases=sensitivity_case_count(
+                                    record, contexts[record["id"]]
+                                ),
+                                completed_case=False,
+                            )
+                            for bid, block in blocks.items()
+                            if block["kind"] == "output"
+                        ]
                     rows.extend(
                         dict(r, spectrum=record["name"], spectrum_id=record["id"]) for r in result
                     )
+                    completed += len({r["case"] for r in result if r.get("completed_case", True)})
                 return rows
 
             def done(rows):
@@ -468,12 +589,23 @@ class WorkflowMixin:
                                 if summary["failed"]
                                 else ""
                             )
+                            + (
+                                f"; НЕПОЛНАЯ проверка: {summary['completed']}/{summary['planned']} сценариев"
+                                if summary["partial"]
+                                else ""
+                            )
                         )
+                completed = len(
+                    {(r["spectrum_id"], r["case"]) for r in rows if r.get("completed_case", True)}
+                )
+                planned = sum(sensitivity_case_count(r, contexts[r["id"]]) for r in records)
                 window.status.set(
-                    "\n".join(summaries[:6])
+                    f"Завершено сценариев: {completed}/{planned}. "
+                    + ("Проверка неполная.\n" if completed < planned else "\n")
+                    + "\n".join(summaries[:6])
                     + "\nДиапазон относится только к этим изменениям, это не погрешность измерения. Группы Spintegrate сопоставляются заново; потерянные линии дают ошибку."
                 )
-                self.last_sensitivity = rows
+                self.last_sensitivity = rows if completed == planned else None
                 self._sensitivity_snapshot = (
                     copy.deepcopy(records),
                     copy.deepcopy(self.formula_document.snapshot()),
@@ -481,7 +613,12 @@ class WorkflowMixin:
                     self.integration_method.get(),
                 )
 
-            window.start(work, done)
+            def failed(_message):
+                run_button.configure(state="normal")
+                self.last_sensitivity = None
+                self._sensitivity_snapshot = None
+
+            window.start(work, done, failed=failed)
 
         run_button = tk.Button(window.options, text="Оценить", command=run)
         run_button.pack(side="left", padx=8)
@@ -647,9 +784,10 @@ class WorkflowMixin:
 
         def work(stop):
             outputs, rows = {}, []
-            for sid, record in old["records"].items():
+            for index, (sid, record) in enumerate(old["records"].items()):
                 if stop.is_set():
-                    return {}, []
+                    return outputs, rows
+                window.report_progress(index, len(old["records"]), f"Спектр {record['name']}")
                 try:
                     result, diagnostic = apply_template(record, recipe, **options)
                     outputs[sid] = result
@@ -680,6 +818,7 @@ class WorkflowMixin:
                     rows.append(
                         (record["name"], None, None, None, None, 0, "Ошибка: " + str(error))
                     )
+                window.report_progress(index + 1, len(old["records"]), f"Спектр {record['name']}")
             return outputs, rows
 
         def done(payload):
@@ -854,7 +993,11 @@ class WorkflowMixin:
         formula = self.formula_preset_data()
         window = ResultsWindow(self, "Himera · Экспорт отчёта", ("Файл", "Состояние"))
 
-        def done(_payload):
+        def done(written):
+            if not written:
+                window.set_rows([(filename, "Остановлено; файл не записан")])
+                window.status.set("Остановлено. Экспорт не записан; существующий файл не изменён.")
+                return
             window.set_rows([(filename, "Сохранён")])
             window.status.set(
                 "Самодостаточный HTML: графики, параметры обработки, интегралы, формулы и результаты. Откройте в браузере; для PDF используйте печать."

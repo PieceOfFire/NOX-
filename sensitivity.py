@@ -49,8 +49,22 @@ def evaluate_contexts(blocks, record, contexts, absolute):
     return FormulaEngine(blocks, provider).outputs()
 
 
+def sensitivity_case_count(record, contexts):
+    has_fits = any(i and i.get("spin_fit_id") for i, _ in contexts.values())
+    return 7 if record.get("corrected") is not None or has_fits else 5
+
+
 def analyze_sensitivity(
-    record, blocks, contexts, *, delta=0.001, baseline_percent=5.0, absolute=False, stop=None
+    record,
+    blocks,
+    contexts,
+    *,
+    delta=0.001,
+    baseline_percent=5.0,
+    absolute=False,
+    stop=None,
+    progress=None,
+    keep_partial=False,
 ):
     if not np.isfinite(delta) or delta <= 0 or not 0 < baseline_percent <= 50:
         raise ValueError("δ должно быть > 0, изменение линии — от 0 до 50%.")
@@ -71,9 +85,12 @@ def analyze_sensitivity(
             (f"Вычитание линии +{baseline_percent:g}% / λ×1.2", 0, 0, 1 + fraction, 1.2),
         ]
     rows = []
-    for label, expand, floor, strength, lam in cases:
+    for case_index, (label, expand, floor, strength, lam) in enumerate(cases):
         if stop is not None and stop.is_set():
-            return []
+            return rows if keep_partial else []
+        progress_label = f"Сценарий {case_index + 1}/{len(cases)} · {label}"
+        if progress:
+            progress(case_index, len(cases), progress_label)
         try:
             trial = copy.deepcopy(record)
             moved = copy.deepcopy(contexts)
@@ -126,6 +143,7 @@ def analyze_sensitivity(
                         value=result.value,
                         status=result.status,
                         message=result.message,
+                        planned_cases=len(cases),
                     )
                 )
         except (ValueError, RuntimeError, ArithmeticError) as error:
@@ -138,8 +156,11 @@ def analyze_sensitivity(
                         value=None,
                         status="error",
                         message=str(error),
+                        planned_cases=len(cases),
                     )
                 )
+        if progress:
+            progress(case_index + 1, len(cases), progress_label)
     return rows
 
 
@@ -153,6 +174,8 @@ def summarize_sensitivity(rows):
             if r["status"] == "ready" and r["value"] is not None and np.isfinite(r["value"])
         ]
         nominal = subset[0]["value"]
+        planned = max(r.get("planned_cases", len(subset)) for r in subset)
+        completed = len({r["case"] for r in subset if r.get("completed_case", True)})
         spread = (
             max((abs(v - nominal) for v in values), default=None) if nominal is not None else None
         )
@@ -165,6 +188,9 @@ def summarize_sensitivity(rows):
                 high=max(values) if values else None,
                 percent=relative,
                 failed=sum(r["status"] != "ready" for r in subset),
+                completed=completed,
+                planned=planned,
+                partial=completed < planned,
             )
         )
     return summaries

@@ -10,7 +10,7 @@ import numpy as np
 from gui_smoke import make_processed
 from live_spin_gui_smoke import settled
 from main import SpectrumApp
-from baseline_methods import MORE_OPTIONS, EXTENDED_METHODS
+from baseline_methods import MORE_OPTIONS, EXTENDED_METHODS, method_label
 from nmr_dialogs import CorrectionDialog
 from processing_templates import apply_baseline_steps
 from spin_backend import same_state
@@ -35,6 +35,7 @@ def main():
             d = CorrectionDialog(app)
             d.attributes("-alpha", 0)
             assert d.method.get() == "Адаптивный arPLS"
+            assert d.method_display.get() == method_label("Адаптивный arPLS")
             assert MORE_OPTIONS in d.method_box.cget("values")
             assert not d.auto_button.winfo_ismapped()
             app.update()
@@ -48,6 +49,10 @@ def main():
             assert len(d.method_box.cget("values")) == 13
             assert MORE_OPTIONS not in d.method_box.cget("values")
             assert d.tk.getboolean(d.tk.call("winfo", "ismapped", popup))
+            # Long full names must fit the actual native popup, not just its values.
+            longest = max(EXTENDED_METHODS.values(), key=len)
+            text_width = int(d.tk.call("font", "measure", d.method_box.cget("font"), longest))
+            assert int(d.tk.call("winfo", "width", popup)) >= text_width + 16
             assert not [w for w in d.winfo_children() if w.winfo_class() == "Toplevel"]
             d.method_box.tk.call("ttk::combobox::Unpost", str(d.method_box))
             assert d.method.get() == "Адаптивный arPLS"
@@ -66,7 +71,7 @@ def main():
             assert d.method.get() == "Spintegrate: snip"
             assert d.extended_settings["half_window"] == 25
             for method in ("Фильтр Уиттакера", "Адаптивный arPLS", EXTENDED_METHODS["snip"]):
-                d.method_display.set(method)
+                d.method_display.set(method_label(method))
                 d.method_box.event_generate("<<ComboboxSelected>>")
                 app.update()
                 assert d.extended_parameters.winfo_ismapped() == (
@@ -92,15 +97,22 @@ def main():
             settled(app, w)
             assert w.parameters.follow_nox.get()
             assert w.parameters.vars["baseline.method"].get() == "none"
+            assert w.parameters.baseline_display.get() == EXTENDED_METHODS["none"]
+            assert set(w.parameters.baseline_method_box.cget("values")) == set(
+                EXTENDED_METHODS.values()
+            )
             assert "NOX" in w.parameters.baseline_context_note.get()
             np.testing.assert_array_equal(w.states[w.active_sid]["models"][0]["baseline"], 0)
-            w.parameters.vars["baseline.method"].set("snip")
+            w.parameters.baseline_display.set(EXTENDED_METHODS["snip"])
+            w.parameters.baseline_method_box.event_generate("<<ComboboxSelected>>")
             settled(app, w)
             assert not w.parameters.follow_nox.get()
+            assert w.parameters.vars["baseline.method"].get() == "snip"
             assert w.states[w.active_sid]["recipe"]["baseline_default"]["method"] == "snip"
             w.parameters.follow_nox.set(True)
             settled(app, w)
             assert w.parameters.vars["baseline.method"].get() == "none"
+            assert w.parameters.baseline_display.get() == EXTENDED_METHODS["none"]
             w.parameters.auto_button.invoke()
             settled(app, w)
             assert w.parameters.vars["baseline.method"].get() == "none"

@@ -17,16 +17,24 @@ def main():
     assert child is not None
     app = None
     try:
-        Application = load_application(splash)
+        timings = []
+        Application = load_application(splash, timing=lambda *args: timings.append(args))
         imported = time.perf_counter() - started
+        created_at = time.perf_counter()
         app = Application()
+        constructed = time.perf_counter() - created_at
         app.attributes("-alpha", 0)
+        layout_at = time.perf_counter()
         app.update_idletasks()
+        layout = time.perf_counter() - layout_at
+        assert not {'scipy', 'nmrglue', 'pybaselines', 'spintegrate.core'} & sys.modules.keys()
+        assert len(timings) == 4 and all(elapsed >= 0 for _, elapsed in timings)
         # Splash and working window have separate Tcl interpreters/default roots.
         assert app.integration_method._tk is app.tk
         assert app.winfo_width() > 900
         splash.update("Готово", 5)
         splash.close()
+        ready = time.perf_counter() - started
         assert child.poll() == 0
         assert splash.process is None
         app.update()
@@ -77,7 +85,9 @@ def main():
     finally:
         progress.process = None
     print(
-        f"STARTUP GUI OK: cold imports {imported:.2f}s; ready window, independent animation, EOF cleanup, cancellation"
+        f"STARTUP GUI OK: fresh-process imports {imported:.2f}s, "
+        f"construction {constructed:.2f}s, layout {layout:.2f}s, ready {ready:.2f}s; "
+        "independent animation, EOF cleanup, cancellation"
     )
 
 

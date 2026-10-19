@@ -16,19 +16,21 @@ from spin_backend import (
     fit_current,
     pack_data,
     pack_spin,
-    same_state,
     selected_region_area,
     unpack_data,
     unpack_spin,
 )
 from spin_groups import group_area
+from spectrum_library import clean_title, read_bruker_title
 from workflow_tools import WorkflowMixin
+from batch_workflow import BatchWorkflowMixin
 
 
-class HimeraApp(WorkflowMixin, NoxApp):
+class HimeraApp(BatchWorkflowMixin, WorkflowMixin, NoxApp):
     INTEGRATION_DISPLAYS = (*NoxApp.INTEGRATION_DISPLAYS, SPIN_DISPLAY)
 
     def __init__(self):
+        self.initialize_batch()
         self._embedded_sources = {}
         self._spin_busy = self._spin_selecting = False
         self._spin_subfit = None
@@ -45,6 +47,51 @@ class HimeraApp(WorkflowMixin, NoxApp):
         )
         self.bind("<Escape>", self.stop_spin_selection, add="+")
         self.integral_table.bind("<Double-1>", self.edit_spin_integral)
+        self.install_batch_controls()
+        from integral_inspector import IntegralInspector
+
+        self.integral_inspector = IntegralInspector(self)
+        self.after_idle(self.restore_view_preferences)
+
+    def export_integrals_csv(self, *, scope="current"):
+        from integral_csv_view import export_integrals_csv
+
+        return export_integrals_csv(self, scope=scope)
+
+    def focus_integral(self, spectrum_id, number, *, comparison_id=None):
+        """Return from a diagnostic snapshot to its actual editable source."""
+        if self._spectrum_dialog_open or spectrum_id not in self.spectra:
+            return False
+        comparison = self.comparisons.get(comparison_id)
+        if comparison_id is not None and (
+            comparison is None or spectrum_id not in comparison["spectrum_ids"]
+        ):
+            self.status.set(
+                "Исходный график сравнения изменён или удалён. Откройте проверку заново."
+            )
+            return False
+        items = (
+            comparison.get("integrals", [])
+            if comparison
+            else self.integrals
+            if self.active_spectrum_id == spectrum_id
+            else self.spectra[spectrum_id].get("integrals", [])
+        )
+        item = next((i for i in items if i.get("number") == number), None)
+        if item is None:
+            self.status.set(f"I{number} не найден: данные изменились после диагностики.")
+            return False
+        if comparison:
+            if self.current_comparison_id != comparison_id:
+                self.save_active_spectrum()
+                self.current_comparison_id = comparison_id
+                self.restore_active_spectrum(spectrum_id)
+                self.draw_comparison()
+        else:
+            if self.current_comparison_id is not None or self.active_spectrum_id != spectrum_id:
+                self.activate_spectrum(spectrum_id)
+        self.integral_inspector.select(item, sid=spectrum_id, zoom=True)
+        return True
 
     def edit_spin_integral(self, event):
         comparison = self.comparison_record()
@@ -55,7 +102,11 @@ class HimeraApp(WorkflowMixin, NoxApp):
             index = int(column[1:]) - 2
             items = sorted(comparison.get("integrals", []), key=lambda i: i["number"])
             if 0 <= index < len(items) and items[index].get("spin_fit_id"):
-                self.open_spin_diagnostics(items[index]["spin_fit_id"])
+                row = self.integral_table.identify_row(event.y)
+                if row.startswith("s"):
+                    self.open_spin_diagnostics(
+                        items[index]["spin_fit_id"], spectrum_id=int(row[1:])
+                    )
                 return "break"
             return
         iid = self.integral_table.identify_row(event.y)
@@ -64,13 +115,19 @@ class HimeraApp(WorkflowMixin, NoxApp):
             self.open_spin_diagnostics()
             return "break"
 
+    def destroy(self):
+        if self.__dict__.get("_batch_poll") is not None:
+            self.after_cancel(self._batch_poll)
+            self._batch_poll = None
+        super().destroy()
+
     def undo_last_action(self, event=None):
-        if self._spin_workspace is not None:
+        if self._spin_workspace is not None or self._spectrum_dialog_open:
             return "break"
         return super().undo_last_action(event)
 
     def redo_last_action(self, event=None):
-        if self._spin_workspace is not None:
+        if self._spin_workspace is not None or self._spectrum_dialog_open:
             return "break"
         return super().redo_last_action(event)
 
@@ -107,6 +164,7 @@ class HimeraApp(WorkflowMixin, NoxApp):
             messagebox.showerror("Spintegrate", str(error), parent=self)
 
     def arm_spin_selection(self, settings):
+        self.integral_boundary_editor.set_active(False)
         self.spin_settings = copy.deepcopy(settings)
         self.spin_settings.update(source="current", regions=[])
         self._spin_selecting = True
@@ -142,6 +200,10 @@ class HimeraApp(WorkflowMixin, NoxApp):
         self.stop_spin_selection()
         super().toggle_integration()
 
+    def toggle_integral_boundaries(self):
+        self.stop_spin_selection()
+        super().toggle_integral_boundaries()
+
     def toggle_x_zoom(self):
         self.stop_spin_selection()
         super().toggle_x_zoom()
@@ -149,9 +211,21 @@ class HimeraApp(WorkflowMixin, NoxApp):
     def on_spectrum_selected(self, event=None):
         self.stop_spin_selection()
         super().on_spectrum_selected(event)
+        if (
+            self.batch_session
+            and not self._batch_running
+            and self.active_spectrum_id in self.batch_session.spectrum_ids
+            and self.current_comparison_id is None
+        ):
+            self.batch_session.select(self.active_spectrum_id)
+            self._refresh_batch_bar()
 
     def open_phase_dialog(self):
+        if self._batch_running:
+            self.status.set("Дождитесь окончания фоновой обработки серии.")
+            return
         self.stop_spin_selection()
+        self.batch_before_phase()
         super().open_phase_dialog()
 
     def open_correction_dialog(self):
@@ -169,6 +243,7 @@ class HimeraApp(WorkflowMixin, NoxApp):
         super().on_x_selected(xmin, xmax)
 
     def arm_fitted_integral(self):
+        self.integral_boundary_editor.set_active(False)
         if self._spin_busy:
             return
         comparison = self.comparison_record()
@@ -381,30 +456,6 @@ class HimeraApp(WorkflowMixin, NoxApp):
             return True
         return super().apply_history_state(kind, state)
 
-    def capture_spectrum_state(self):
-        state = super().capture_spectrum_state()
-        record = self.spectra.get(self.active_spectrum_id)
-        if record:
-            state["himera"] = dict(
-                spin_analyses=copy.deepcopy(record.get("spin_analyses", {})),
-                last_spin_fit=record.get("last_spin_fit"),
-                baseline_steps=copy.deepcopy(record.get("baseline_steps", [])),
-                baseline_source_unknown=record.get("baseline_source_unknown", False),
-            )
-        return state
-
-    def spectrum_state_changed(self, previous):
-        return super().spectrum_state_changed(previous) or not same_state(
-            previous.get("himera"), self.capture_spectrum_state().get("himera")
-        )
-
-    def restore_spectrum_state(self, state):
-        super().restore_spectrum_state(state)
-        record = self.spectra.get(self.active_spectrum_id)
-        if record and "himera" in state:
-            record.update(copy.deepcopy(state["himera"]))
-        self.save_active_spectrum()
-
     def record_integral_area(self, record, left, right, *, x_offset=0, integral=None):
         fit_id = integral.get("spin_fit_id") if integral else None
         if fit_id:
@@ -487,11 +538,7 @@ class HimeraApp(WorkflowMixin, NoxApp):
     def draw_integrals(self):
         # Group integrals share a fit domain; do not pile identical shaded rectangles/labels.
         items = self.integrals
-        self.integrals = [i for i in items if not i.get("spin_group_id")]
-        try:
-            super().draw_integrals()
-        finally:
-            self.integrals = items
+        super().draw_integrals([i for i in items if not i.get("spin_group_id")])
         self.draw_spin_domains(self.axes, items)
         self.update_integral_table(self.ordered_integrals())
 
@@ -537,7 +584,7 @@ class HimeraApp(WorkflowMixin, NoxApp):
             )
             if transform:
                 curve = transform(curve)
-            axes.plot(
+            (line,) = axes.plot(
                 x,
                 curve,
                 color=item["color"],
@@ -546,6 +593,8 @@ class HimeraApp(WorkflowMixin, NoxApp):
                 alpha=0.85,
                 label=f"I{item['number']} · {item['name']}" if not comparison else None,
             )
+            line._integral_item_id = item.get("id")
+            line._integral_spectrum_id = record.get("id")
             index = int(np.argmax(np.abs(curve - np.median(curve))))
             axes.annotate(
                 f"I{item['number']}",
@@ -626,6 +675,9 @@ class HimeraApp(WorkflowMixin, NoxApp):
             self.fit_visible_plot_y()
         if not kwargs.get("preview", False):
             self.refresh_calculations()
+            inspector = getattr(self, "integral_inspector", None)
+            if inspector:
+                inspector.schedule_refresh()
 
     def draw_comparison(self, **kwargs):
         super().draw_comparison(**kwargs)
@@ -685,8 +737,13 @@ class HimeraApp(WorkflowMixin, NoxApp):
                         )
             self.canvas.draw_idle()
         self.refresh_calculations()
+        self.refresh_spectrum_library()
+        inspector = getattr(self, "integral_inspector", None)
+        if inspector:
+            inspector.schedule_refresh()
 
     def prepare_project_load(self, project):
+        self._batch_load_candidate = project.get("manual_batch")
         saved = project.get("spin_settings")
         self.spin_settings = copy.deepcopy(saved) if isinstance(saved, dict) else None
         if self.spin_settings:
@@ -717,6 +774,9 @@ class HimeraApp(WorkflowMixin, NoxApp):
             id=sid,
             name=payload.get("name") or Path(folder).name,
             source_folder=Path(folder).resolve(),
+            bruker_title=clean_title(payload.get("bruker_title"))
+            if "bruker_title" in payload
+            else read_bruker_title(folder),
             **data,
             integrals=[],
             reference_integral_id=None,
@@ -727,12 +787,30 @@ class HimeraApp(WorkflowMixin, NoxApp):
         self.activate_spectrum(sid)
         return True
 
+    def load_spectrum_folder(self, folder, **kwargs):
+        if self._batch_running:
+            return False
+        if hasattr(self, "batch_bar"):
+            self.restore_batch_queue(None)
+        return super().load_spectrum_folder(folder, **kwargs)
+
     def open_project(self):
-        if self._spin_busy:
+        if self._spin_busy or self._batch_running or self._spectrum_dialog_open:
             return
         self.stop_spin_selection()
+        self._batch_load_candidate = None
+        previous_record = self.spectra.get(self.active_spectrum_id)
         try:
             super().open_project()
+            if self.spectra.get(self.active_spectrum_id) is not previous_record:
+                try:
+                    self.restore_batch_queue(self._batch_load_candidate)
+                except (ValueError, TypeError, KeyError) as error:
+                    messagebox.showwarning(
+                        "Очередь серии",
+                        f"Спектры открыты, но очередь не восстановлена: {error}",
+                        parent=self,
+                    )
             # The first beta applied its fit to all integral rows. Preserve these
             # explicitly when reading it, without resurrecting global modes.
             for comparison in self.comparisons.values():
@@ -766,6 +844,10 @@ class HimeraApp(WorkflowMixin, NoxApp):
     def project_data(self):
         payload = super().project_data()
         payload.update(application="himera", version=3, spin_settings=self.spin_settings)
+        if self.batch_session is not None:
+            payload["manual_batch"] = self.batch_session.to_payload(
+                {sid: index for index, sid in enumerate(self.spectra)}
+            )
         return payload
 
     def restore_project_integrals(self, raw, reference):
@@ -784,6 +866,8 @@ class HimeraApp(WorkflowMixin, NoxApp):
         if extra.get("version") not in (1, 2):
             raise ValueError("Неподдерживаемая версия данных Himera.")
         record = self.spectra[self.active_spectrum_id]
+        if "bruker_title" in payload:
+            record["bruker_title"] = clean_title(payload["bruker_title"])
         record.update(unpack_data(extra["data"]))
         record["spin_analyses"] = {
             key: unpack_spin(s) for key, s in extra.get("spin_analyses", {}).items()
@@ -810,21 +894,28 @@ class HimeraApp(WorkflowMixin, NoxApp):
                 item.setdefault("spin_fit_id", "legacy-beta")
         self.save_active_spectrum()
 
-    def open_spin_diagnostics(self, fit_id=None):
+    def open_spin_diagnostics(self, fit_id=None, *, spectrum_id=None):
         if self._spin_busy or self._spectrum_dialog_open:
             return
         self.save_active_spectrum()
-        record = self.spectra.get(self.active_spectrum_id, {})
-        available = self.relevant_fit_ids(record) if record else set()
         selection = self.integral_table.selection()
         comparison = self.comparison_record()
+        if spectrum_id is None and comparison and selection and selection[0].startswith("s"):
+            spectrum_id = int(selection[0][1:])
+        spectrum_id = self.active_spectrum_id if spectrum_id is None else spectrum_id
+        ids = comparison["spectrum_ids"] if comparison else [self.active_spectrum_id]
+        if spectrum_id not in ids or spectrum_id not in self.spectra:
+            return
+        record = self.spectra[spectrum_id]
+        available = self.relevant_fit_ids(record)
+        explicit_fit = fit_id is not None
         items = comparison.get("integrals", []) if comparison else record.get("integrals", [])
         chosen = next(
             (i for i in items if str(i["id"]) in selection and i.get("spin_fit_id")),
             None,
         )
         fit_id = fit_id or (chosen["spin_fit_id"] if chosen else record.get("last_spin_fit"))
-        if fit_id not in available:
+        if fit_id not in available and not explicit_fit:
             fit_id = next(iter(sorted(available)), None)
         state = record.get("spin_analyses", {}).get(fit_id)
         if state is None:
@@ -841,7 +932,6 @@ class HimeraApp(WorkflowMixin, NoxApp):
             return
         from spin_workspace import SpinWorkspace
 
-        ids = comparison["spectrum_ids"] if comparison else [self.active_spectrum_id]
         records = {sid: self.spectra[sid] for sid in ids}
         initial = {
             sid: r["spin_analyses"][fit_id]
@@ -878,6 +968,7 @@ class HimeraApp(WorkflowMixin, NoxApp):
         job = dict(
             fit_id=fit_id,
             edit=True,
+            initial_sid=spectrum_id,
             comparison_id=comparison["id"] if comparison else None,
             left=state["models"][0]["low"] + offset + delta,
             right=state["models"][0]["high"] + offset + delta,

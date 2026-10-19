@@ -2,7 +2,6 @@
 
 import copy
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 from spin_backend import fit_current, model_component_areas
 
 
@@ -37,6 +36,11 @@ def component_matches(old, new, tolerance):
     old, new = np.asarray(old, dtype=float), np.asarray(new, dtype=float)
     if not len(old) or not len(new):
         return {}
+    # The main window imports this module for group metadata. Importing SciPy
+    # here would otherwise load its whole optimiser stack on every app launch,
+    # even when the operator never uses Spintegrate or component matching.
+    from scipy.optimize import linear_sum_assignment
+
     distance = np.abs(old[:, None] - new[None, :])
     tolerances = local_tolerances(old, tolerance)
     rows, cols = linear_sum_assignment(np.where(distance <= tolerances[:, None], distance, 1e6 + distance))

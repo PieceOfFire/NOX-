@@ -121,7 +121,7 @@ class PresetLibrary:
         preset = json.loads(path.read_text(encoding="utf-8-sig"))
         document = FormulaDocument.from_preset(preset)
         if not document.blocks:
-            raise ValueError("в пресете нет блоков")
+            raise ValueError("в формуле нет блоков")
         if import_copy and path.parent != self.user_directory.resolve():
             self.user_directory.mkdir(parents=True, exist_ok=True)
             destination = self.user_directory / path.name
@@ -145,7 +145,7 @@ class PresetLibrary:
         name = str(preset.get("name") or path.stem)
         required = ", ".join(f"I{n}" for n in document.area_numbers())
         entry = PresetEntry(
-            key, name, f"Пользовательский пресет · {required or 'без интегралов'}", preset, path
+            key, name, f"Пользовательская формула · {required or 'без интегралов'}", preset, path
         )
         if import_copy:
             for old_key, old in list(self.entries.items()):

@@ -32,8 +32,28 @@ from formula_engine import FormulaEngine
 from formula_presets import PresetLibrary
 from calculations_view import CalculationsView
 from integration import integrate_region
+from integral_editor import IntegralBoundaryEditor
 from ui_helpers import add_tooltip
 from ui_theme import install_theme
+from view_preferences import (
+    capture_table_view,
+    read_preferences,
+    restore_table_view,
+    usable_limits,
+    visible_geometry,
+    write_preferences,
+)
+from spectrum_binding import ActiveSpectrum, SpectrumVariable
+from spectrum_state import current_signal, same_state
+from spectrum_library import (
+    SpectrumLibrary,
+    clean_title,
+    library_status,
+    matches_search,
+    read_bruker_title,
+    spectrum_details,
+    spectrum_label,
+)
 
 try:
     # Tk сам по себе не умеет принимать файлы из Проводника. tkinterdnd2
@@ -58,7 +78,7 @@ def choose_windows_folders(parent_hwnd: int) -> tuple[str, ...] | None:
     return _choose_windows_folders(parent_hwnd)
 
 
-class SpectrumApp(_RootWindow):
+class SpectrumApp(ActiveSpectrum, _RootWindow):
     add_formula_tooltip = staticmethod(add_tooltip)
     DECONVOLUTION_METHOD = "Деконволюция"
     LEGACY_LORENTZIAN_METHOD = "Аппроксимация Лоренца"
@@ -80,9 +100,19 @@ class SpectrumApp(_RootWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        self.initialize_spectrum_store()
         install_theme(self)
         self.title("NOX · Обработка спектров")
         self.minsize(950, 620)
+        self._view_preferences = read_preferences()
+        self.linked_ppm_view = tk.BooleanVar(value=self._view_preferences["linked_ppm"])
+        self.auto_y_on_switch = tk.BooleanVar(value=self._view_preferences["auto_y"])
+        self.library_visible = tk.BooleanVar(value=self._view_preferences["library_visible"])
+        self.integral_table_visible = tk.BooleanVar(value=self._view_preferences["table_visible"])
+        self._plot_views = {}
+        self._integral_table_views = {}
+        self._last_integral_table_context = None
+        self._integral_table_refreshing = False
         self.project_path: Path | None = None
         self.source_folder: Path | None = None
         self.ppm_shift = 0.0
@@ -94,12 +124,12 @@ class SpectrumApp(_RootWindow):
         self._spectrum_dialog_open = False
         self.formula_document = FormulaDocument()
         self.formula_editor = None
-        self.formula_status = tk.StringVar(value="Выберите пресет на вкладке «Расчёты».")
+        self.formula_status = tk.StringVar(value="Выберите формулу на вкладке «Расчёты».")
         self.preset_library = PresetLibrary(Path(__file__).resolve().parent)
         self.active_preset_key = None
         self._formula_engines = {}
-        self.integration_method = tk.StringVar(value="Обычная площадь")
-        self.integration_display = tk.StringVar(value="Площадь")
+        self.integration_method = SpectrumVariable(self, "integration_method")
+        self.integration_display = SpectrumVariable(self, "integration_display")
         # Отдельная переменная нужна виджетам выбора: радиокнопка изменяет
         # свою переменную до callback, а для истории нам важно ещё знать
         # прежний режим расчёта.
@@ -130,11 +160,8 @@ class SpectrumApp(_RootWindow):
         self.reference_integral_id: int | None = None
         self._next_integral_id = 1
         self.integral_colors = ("#e45756", "#4c78a8", "#59a14f", "#f28e2b", "#b279a2", "#76b7b2")
-        # Библиотека хранит независимое состояние каждого добавленного
-        # спектра. Поля self.ppm/self.corrected ниже всегда соответствуют
-        # только выбранной строке библиотеки — так существующие диалоги
-        # фазирования и коррекции не знают о многоспектральном режиме.
-        self.spectra: dict[int, dict[str, object]] = {}
+        # Legacy dialog attributes are live views of the selected library record.
+        # There is no additional working copy to save back during drawing.
         self._next_spectrum_id = 1
         self.active_spectrum_id: int | None = None
         self.comparisons: dict[int, dict[str, object]] = {}
@@ -158,6 +185,14 @@ class SpectrumApp(_RootWindow):
         )
         self.integration_button.pack(side="left", padx=1)
         self.add_formula_tooltip(self.integration_button, "Режим интегрирования")
+        self.integral_bounds_button = tk.Button(
+            controls, text="↔∫", width=3, command=self.toggle_integral_boundaries
+        )
+        self.integral_bounds_button.pack(side="left", padx=1)
+        self.add_formula_tooltip(
+            self.integral_bounds_button,
+            "Изменить границы интегралов: перетащите вертикальные линии",
+        )
         self.zoom_button = tk.Button(controls, text="🔍 Выбрать X", command=self.toggle_x_zoom)
         self.zoom_button.pack(side="left", padx=5)
         tk.Button(controls, text="Сбросить ширину", command=self.reset_x_zoom).pack(side="left")
@@ -179,33 +214,19 @@ class SpectrumApp(_RootWindow):
             relief="flat",
         )
         body.pack(fill="both", expand=True)
-        library = tk.LabelFrame(body, text="  Спектры  ", padx=6, pady=6)
+        self.library_split = body
+        library = tk.Frame(body, padx=4, pady=6)
+        self.library_panel = library
         analysis = tk.Frame(body)
-        body.add(library, minsize=150)
+        self.analysis_panel = analysis
+        body.add(library, minsize=230, width=330)
         body.add(analysis, minsize=620)
-        tk.Label(library, text="Спектры и сравнения", anchor="w").pack(fill="x")
-        list_body = tk.Frame(library)
-        list_body.pack(fill="both", expand=True, pady=(4, 0))
-        list_scroll = tk.Scrollbar(list_body, orient="vertical")
-        list_scroll.pack(side="right", fill="y")
-        self.spectrum_list = tk.Listbox(
-            list_body,
-            exportselection=False,
-            activestyle="none",
-            yscrollcommand=list_scroll.set,
-            width=20,
+        self.spectrum_library = SpectrumLibrary(
+            library, self.refresh_spectrum_library, self.on_spectrum_selected
         )
-        self.spectrum_list.pack(side="left", fill="both", expand=True)
-        list_scroll.configure(command=self.spectrum_list.yview)
-        self.spectrum_list.bind("<<ListboxSelect>>", self.on_spectrum_selected)
+        self.spectrum_library.pack(fill="both", expand=True)
+        self.spectrum_list = self.spectrum_library.tree
         self.enable_spectrum_drop(library)
-        tk.Label(
-            library,
-            text="Клик по спектру открывает\nобработку; по сравнению —\nобщий график. Можно\nперетащить 1r или папку.",
-            justify="left",
-            fg="#68707d",
-            wraplength=145,
-        ).pack(fill="x", pady=(8, 0))
 
         self.spectrum_split = tk.PanedWindow(
             analysis,
@@ -223,7 +244,7 @@ class SpectrumApp(_RootWindow):
         self.plot_frame.pack_propagate(False)
         self.spectrum_split.add(self.plot_frame, minsize=180)
         self._integral_table_visible = False
-        self.graph_height_percent = 68
+        self.graph_height_percent = self._view_preferences["graph_percent"]
         self.figure = Figure(figsize=(9, 5), dpi=100)
         self.axes = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
@@ -232,6 +253,7 @@ class SpectrumApp(_RootWindow):
         self.canvas.mpl_connect("button_press_event", self.on_plot_click)
         self.span: SpanSelector | None = None
         self.create_span_selector()
+        self.integral_boundary_editor = IntegralBoundaryEditor(self, self.integral_bounds_button)
         self.bind("<FocusIn>", lambda _event: self.restore_interaction_mode())
         # У Frame в Tk для Windows padding должен быть одним числом;
         # асимметричные отступы допустимы только в pack/grid.
@@ -285,6 +307,185 @@ class SpectrumApp(_RootWindow):
         self.integral_table.bind("<Control-KeyPress>", self.copy_integral_table_shortcut)
         self.calculations_view = CalculationsView(self.calculations_tab, self)
         self.refresh_formula_workspace()
+        self.library_split.bind(
+            "<ButtonRelease-1>", lambda _event: self.after_idle(self.capture_view_layout), add="+"
+        )
+        self.spectrum_split.bind(
+            "<ButtonRelease-1>", lambda _event: self.after_idle(self.capture_view_layout), add="+"
+        )
+
+    def _integral_table_context(self):
+        return (
+            ("comparison", self.current_comparison_id)
+            if self.current_comparison_id is not None
+            else ("spectrum", self.active_spectrum_id)
+        )
+
+    def _table_view_before_refresh(self):
+        context = self._integral_table_context()
+        if self._last_integral_table_context == context:
+            self._integral_table_views[context] = capture_table_view(self.integral_table)
+        self._last_integral_table_context = context
+        self._integral_table_refreshing = True
+        return self._integral_table_views.get(context, {})
+
+    def _table_view_after_refresh(self, state):
+        restore_table_view(self.integral_table, state)
+        self._integral_table_refreshing = False
+
+    def _remember_plot_view(self):
+        if self.ppm is None:
+            return None
+        context = self._integral_table_context()
+        comparison = self.comparison_record()
+        view = {
+            "xlim": self.axes.get_xlim(),
+            "ylim": self.axes.get_ylim(),
+            "stacked": bool(comparison and comparison.get("mode") == "separate"),
+        }
+        self._plot_views[context] = view
+        if self._last_integral_table_context == context:
+            self._integral_table_views[context] = capture_table_view(self.integral_table)
+        return view
+
+    def _restore_plot_view(self, previous):
+        remembered = self._plot_views.get(self._integral_table_context(), {})
+        comparison = self.comparison_record()
+        if comparison:
+            offsets = comparison.get("offsets", {})
+            domains = []
+            for sid in comparison.get("spectrum_ids", []):
+                record = self.spectra.get(int(sid))
+                if record is not None:
+                    offset = float(offsets.get(sid, offsets.get(str(sid), 0)))
+                    ppm = np.asarray(record["ppm"])
+                    domains.extend((float(ppm.min()) + offset, float(ppm.max()) + offset))
+            domain = (min(domains), max(domains)) if domains else None
+        else:
+            domain = (
+                (float(self.ppm.min()), float(self.ppm.max())) if self.ppm is not None else None
+            )
+        source = previous if self.linked_ppm_view.get() and previous else remembered
+        limits = usable_limits(source.get("xlim") if source else None, domain)
+        if limits:
+            self.axes.set_xlim(limits)
+        if self.auto_y_on_switch.get():
+            self.fit_current_view_y()
+        elif not comparison or comparison.get("mode") != "separate":
+            # Without autoscaling, retain a common Y scale only between compatible
+            # plots; a normalized stacked scale is never an intensity scale.
+            source_y = remembered.get("ylim")
+            if not source_y and previous and not previous.get("stacked"):
+                source_y = previous.get("ylim")
+            limits_y = usable_limits(source_y)
+            if limits_y:
+                self.axes.set_ylim(limits_y)
+        self.canvas.draw_idle()
+
+    def fit_current_view_y(self):
+        """Scale only visible data curves, excluding vertical domain markers."""
+        comparison = self.comparison_record()
+        if comparison and comparison.get("mode") == "separate":
+            return
+        if callable(getattr(self, "fit_visible_plot_y", None)):
+            self.fit_visible_plot_y()
+            return
+        low, high = sorted(self.axes.get_xlim())
+        values = []
+        for artist in self.axes.lines:
+            if not artist.get_visible() or artist.get_transform() is not self.axes.transData:
+                continue
+            x, y = np.asarray(artist.get_xdata()), np.asarray(artist.get_ydata())
+            if x.size < 3 or x.shape != y.shape:
+                continue
+            mask = np.isfinite(y) & (x >= low) & (x <= high)
+            if np.any(mask):
+                values.append(y[mask])
+        if values:
+            low_y, high_y = min(float(v.min()) for v in values), max(float(v.max()) for v in values)
+            margin = max((high_y - low_y) * 0.06, np.finfo(float).eps)
+            self.axes.set_ylim(low_y - margin, high_y + margin)
+            self.canvas.draw_idle()
+
+    def capture_view_layout(self):
+        preferences = self._view_preferences
+        if self.winfo_width() > 1 and self.winfo_height() > 1:
+            preferences["geometry"] = self.geometry()
+            preferences["maximized"] = self.state() == "zoomed"
+        if self.library_visible.get() and self.library_split.winfo_width() > 1:
+            try:
+                preferences["library_fraction"] = (
+                    self.library_split.sash_coord(0)[0] / self.library_split.winfo_width()
+                )
+            except tk.TclError:
+                pass
+        if self._integral_table_visible and self.spectrum_split.winfo_height() > 250:
+            try:
+                self.graph_height_percent = min(
+                    85,
+                    max(
+                        30,
+                        self.spectrum_split.sash_coord(0)[1]
+                        * 100
+                        / self.spectrum_split.winfo_height(),
+                    ),
+                )
+            except tk.TclError:
+                pass
+        preferences.update(
+            linked_ppm=self.linked_ppm_view.get(),
+            auto_y=self.auto_y_on_switch.get(),
+            library_visible=self.library_visible.get(),
+            table_visible=self._integral_table_visible,
+            graph_percent=self.graph_height_percent,
+        )
+        return dict(preferences)
+
+    def restore_view_preferences(self):
+        preferences = self._view_preferences
+        if preferences.get("geometry"):
+            self.geometry(
+                visible_geometry(
+                    preferences["geometry"], (self.winfo_screenwidth(), self.winfo_screenheight())
+                )
+            )
+        if preferences.get("maximized"):
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
+        self.update_idletasks()
+        self.toggle_library_panel()
+        self.toggle_integral_table_panel()
+
+    def toggle_library_panel(self):
+        panes = tuple(map(str, self.library_split.panes()))
+        if self.library_visible.get():
+            if str(self.library_panel) not in panes:
+                self.library_split.add(
+                    self.library_panel, before=self.analysis_panel, minsize=230, width=330
+                )
+            self.update_idletasks()
+            width = self.library_split.winfo_width()
+            if width > 1:
+                self.library_split.sash_place(
+                    0, int(width * self._view_preferences["library_fraction"]), 0
+                )
+        elif str(self.library_panel) in panes:
+            self.library_split.forget(self.library_panel)
+
+    def toggle_integral_table_panel(self):
+        if self.integral_table_visible.get():
+            self.show_integral_table()
+        else:
+            self.hide_integral_table()
+
+    def destroy(self):
+        try:
+            write_preferences(self.capture_view_layout())
+        except tk.TclError:
+            pass
+        super().destroy()
 
     def build_application_menu(self) -> None:
         """Основное меню проекта и команды обработки сигналов."""
@@ -326,6 +527,28 @@ class SpectrumApp(_RootWindow):
                 command=lambda value=display: self.change_integration_display(value),
             )
         settings_menu.add_cascade(label="Вывод значений интегралов", menu=display_menu)
+        view_menu = tk.Menu(settings_menu, tearoff=False)
+        view_menu.add_checkbutton(
+            label="Одинаковый диапазон ppm при переключении",
+            variable=self.linked_ppm_view,
+        )
+        view_menu.add_checkbutton(
+            label="Автомасштаб Y для каждого спектра",
+            variable=self.auto_y_on_switch,
+        )
+        view_menu.add_separator()
+        view_menu.add_checkbutton(
+            label="Библиотека спектров",
+            variable=self.library_visible,
+            command=self.toggle_library_panel,
+        )
+        view_menu.add_checkbutton(
+            label="Таблица интегралов",
+            variable=self.integral_table_visible,
+            command=self.toggle_integral_table_panel,
+        )
+        view_menu.add_command(label="Автомасштаб Y сейчас", command=self.fit_current_view_y)
+        settings_menu.add_cascade(label="Просмотр спектров", menu=view_menu)
         menu_bar.add_cascade(label="Настройки", menu=settings_menu)
         processing_menu = tk.Menu(menu_bar, tearoff=False)
         processing_menu.add_command(label="Фазировать", command=self.open_phase_dialog)
@@ -334,6 +557,9 @@ class SpectrumApp(_RootWindow):
         )
         processing_menu.add_separator()
         processing_menu.add_command(label="Интегрирование", command=self.toggle_integration)
+        processing_menu.add_command(
+            label="Изменить границы интегралов", command=self.toggle_integral_boundaries
+        )
         processing_menu.add_command(label="Вывести несколько…", command=self.open_comparison_dialog)
         processing_menu.add_command(
             label="Автоматически выровнять по X", command=self.auto_align_comparison
@@ -343,9 +569,9 @@ class SpectrumApp(_RootWindow):
         )
         menu_bar.add_cascade(label="Обработка сигналов", menu=processing_menu)
         calculation_menu = tk.Menu(menu_bar, tearoff=False)
-        calculation_menu.add_command(label="Пресеты и результаты", command=self.open_calculations)
+        calculation_menu.add_command(label="Формулы и результаты", command=self.open_calculations)
         calculation_menu.add_command(label="Редактор формул…", command=self.open_formula_editor)
-        calculation_menu.add_command(label="Загрузить пресет…", command=self.load_formula_preset)
+        calculation_menu.add_command(label="Загрузить формулу…", command=self.load_formula_preset)
         menu_bar.add_cascade(label="Расчёты", menu=calculation_menu)
         self.configure(menu=menu_bar)
         self.bind_all("<Control-o>", lambda _event: self.open_project())
@@ -417,16 +643,16 @@ class SpectrumApp(_RootWindow):
         for widget in (library, self.spectrum_list):
             widget.drop_target_register(DND_FILES)
             widget.dnd_bind(
-                "<<DropEnter>>", lambda _event: self.spectrum_list.configure(bg="#eaf3ff")
+                "<<DropEnter>>", lambda _event: self.spectrum_list.set_drop_active(True)
             )
             widget.dnd_bind(
-                "<<DropLeave>>", lambda _event: self.spectrum_list.configure(bg="white")
+                "<<DropLeave>>", lambda _event: self.spectrum_list.set_drop_active(False)
             )
             widget.dnd_bind("<<Drop>>", self.on_spectrum_drop)
 
     def on_spectrum_drop(self, event):
         """Обработчик набора путей, переданного Windows через tkinterdnd2."""
-        self.spectrum_list.configure(bg="white")
+        self.spectrum_list.set_drop_active(False)
         try:
             paths = tuple(str(path) for path in self.tk.splitlist(event.data))
         except tk.TclError:
@@ -443,48 +669,14 @@ class SpectrumApp(_RootWindow):
         self.refresh_formula_workspace()
 
     def save_active_spectrum(self) -> None:
-        """Записать текущее рабочее состояние в выбранную строку библиотеки."""
-        if self.active_spectrum_id is None or self.active_spectrum_id not in self.spectra:
-            return
-        record = self.spectra[self.active_spectrum_id]
-        record.update(
-            {
-                "source_folder": self.source_folder,
-                "ppm": self.ppm,
-                "real": self.real,
-                "imaginary": self.imaginary,
-                "spectral_width_hz": self.spectral_width_hz,
-                "ppm_shift": self.ppm_shift,
-                "phase0": self.phase0,
-                "phase1": self.phase1,
-                "phase_pivot": self.phase_pivot,
-                "phase_reference": self.phase_reference,
-                "corrected": self.corrected,
-                "integrals": self.integrals,
-                "reference_integral_id": self.reference_integral_id,
-                "next_integral_id": self._next_integral_id,
-                "integration_method": self.integration_method.get(),
-                "integration_display": self.integration_display.get(),
-                "title": self._title,
-            }
-        )
+        """Refresh Tk projections; numerical state is already in the library."""
+        self.integration_method.sync()
+        self.integration_display.sync()
+        self.sync_integration_method_choice()
 
     def restore_active_spectrum(self, spectrum_id: int) -> None:
         record = self.spectra[spectrum_id]
         self.active_spectrum_id = spectrum_id
-        self.source_folder = record["source_folder"]  # type: ignore[assignment]
-        self.ppm = record["ppm"]  # type: ignore[assignment]
-        self.real = record["real"]  # type: ignore[assignment]
-        self.imaginary = record["imaginary"]  # type: ignore[assignment]
-        self.spectral_width_hz = float(record["spectral_width_hz"])
-        self.ppm_shift = float(record["ppm_shift"])
-        self.phase0, self.phase1 = float(record["phase0"]), float(record["phase1"])
-        self.phase_pivot = float(record["phase_pivot"])
-        self.phase_reference = record["phase_reference"]  # type: ignore[assignment]
-        self.corrected = record["corrected"]  # type: ignore[assignment]
-        self.integrals = record["integrals"]  # type: ignore[assignment]
-        self.reference_integral_id = record["reference_integral_id"]  # type: ignore[assignment]
-        self._next_integral_id = int(record["next_integral_id"])
         self.integration_method.set(
             self.normalize_integration_method(
                 str(record.get("integration_method", "Обычная площадь"))
@@ -493,24 +685,51 @@ class SpectrumApp(_RootWindow):
         display = str(record.get("integration_display", "Площадь"))
         self.integration_display.set(display if display in self.INTEGRATION_DISPLAYS else "Площадь")
         self.sync_integration_method_choice()
-        self._title = str(record["title"])
 
     def refresh_spectrum_library(self) -> None:
         """Обновить левую библиотеку спектров и созданных сравнений."""
         if not hasattr(self, "spectrum_list"):
             return
-        self.spectrum_list.delete(0, "end")
+        library = self.spectrum_library
+        library.update_batch(
+            getattr(self, "batch_session", None),
+            on_next=getattr(self, "batch_next_attention", None),
+        )
+        query = self.spectrum_library.search.get()
+        rows = []
         self._library_items = []
-        ids = list(self.spectra)
-        for spectrum_id in ids:
-            self.spectrum_list.insert("end", str(self.spectra[spectrum_id]["name"]))
+        statuses = {}
+        for spectrum_id, record in self.spectra.items():
+            if not matches_search(record, query) or not library.accepts(spectrum_id):
+                continue
+            status = statuses[spectrum_id] = library_status(record)
+            summary, tag = library.decorate(spectrum_id, status.summary, bool(status.issues))
+            rows.append((spectrum_label(record), summary, tag))
             self._library_items.append(("spectrum", spectrum_id))
+        visible_spectra = len(rows)
+        visible_comparisons = 0
         for comparison_id, comparison in self.comparisons.items():
-            if len(self.comparisons) and comparison_id == next(iter(self.comparisons)):
-                self.spectrum_list.insert("end", "— Сравнения —")
+            if not library.show_comparisons:
+                break
+            if not matches_search(comparison, query) and not any(
+                matches_search(self.spectra[sid], query)
+                for sid in comparison.get("spectrum_ids", [])
+                if sid in self.spectra
+            ):
+                continue
+            if not visible_comparisons:
+                rows.append(("Сравнения", "", "section"))
                 self._library_items.append(None)
-            self.spectrum_list.insert("end", f"▦  {comparison['name']}")
+            rows.append(
+                (f"▦  {comparison['name']}", f"Спектров: {len(comparison['spectrum_ids'])}", "")
+            )
             self._library_items.append(("comparison", comparison_id))
+            visible_comparisons += 1
+        self.spectrum_list.set_rows(rows)
+        self.spectrum_library.count.set(
+            f"Спектры: {visible_spectra} / {len(self.spectra)}"
+            + (f" · сравнений: {visible_comparisons}" if visible_comparisons else "")
+        )
         selected_item: tuple[str, int] | None = (
             ("comparison", self.current_comparison_id)
             if self.current_comparison_id is not None
@@ -520,8 +739,30 @@ class SpectrumApp(_RootWindow):
         )
         if selected_item in self._library_items:
             position = self._library_items.index(selected_item)
-            self.spectrum_list.selection_set(position)
+            if self.spectrum_list.curselection() != (position,):
+                self.spectrum_list.selection_set(position)
             self.spectrum_list.activate(position)
+        else:
+            self.spectrum_list.selection_clear()
+        if self.current_comparison_id in self.comparisons:
+            comparison = self.comparisons[self.current_comparison_id]
+            names = [
+                str(self.spectra[sid]["name"])
+                for sid in comparison["spectrum_ids"]
+                if sid in self.spectra
+            ]
+            self.spectrum_library.set_details(f"{comparison['name']}\nСпектры: {', '.join(names)}")
+        elif self.active_spectrum_id in self.spectra:
+            record = self.spectra[self.active_spectrum_id]
+            batch_details = library.batch_details(self.active_spectrum_id)
+            self.spectrum_library.set_details(
+                (batch_details + "\n" if batch_details else "")
+                + spectrum_details(record, statuses.get(self.active_spectrum_id))
+            )
+        elif query:
+            self.spectrum_library.set_details(
+                "Ничего не найдено. Измените запрос или очистите поиск кнопкой ×."
+            )
 
     def on_spectrum_selected(self, _event=None) -> None:
         selected = self.spectrum_list.curselection()
@@ -535,19 +776,28 @@ class SpectrumApp(_RootWindow):
             return
         kind, item_id = item
         if kind == "spectrum":
+            if item_id == self.active_spectrum_id and self.current_comparison_id is None:
+                return
             self.activate_spectrum(item_id)
         elif item_id in self.comparisons:
+            if item_id == self.current_comparison_id:
+                return
+            self.integral_boundary_editor.set_active(False)
+            previous_view = self._remember_plot_view()
             self.save_active_spectrum()
             self.current_comparison_id = item_id
             self.clear_history(preserve_formulas=True)
             self.refresh_spectrum_library()
             self.draw_comparison(reset_x=True, reset_y=True)
+            self._restore_plot_view(previous_view)
             self.status.set(f"Открыто {self.comparisons[item_id]['name']}.")
 
     def activate_spectrum(self, spectrum_id: int) -> None:
         """Открыть один спектр из библиотеки и выйти из обзорного графика."""
         if spectrum_id not in self.spectra:
             return
+        previous_view = self._remember_plot_view()
+        self.integral_boundary_editor.set_active(False)
         self.save_active_spectrum()
         self.current_comparison_id = None
         self._comparison_axes = []
@@ -555,6 +805,7 @@ class SpectrumApp(_RootWindow):
         self.clear_history(preserve_formulas=True)
         self.refresh_spectrum_library()
         self.draw(reset_x=True, reset_y=True)
+        self._restore_plot_view(previous_view)
         self.status.set(f"Открыт спектр: {self.spectra[spectrum_id]['name']}.")
 
     def add_spectrum_folder(
@@ -605,6 +856,7 @@ class SpectrumApp(_RootWindow):
             "id": spectrum_id,
             "name": name,
             "source_folder": source_folder,
+            "bruker_title": read_bruker_title(source_folder),
             "ppm": ppm,
             "real": real,
             "imaginary": imaginary,
@@ -630,6 +882,10 @@ class SpectrumApp(_RootWindow):
 
     def load_spectrum_folder(self, folder: str | Path) -> bool:
         """Открыть одиночный спектр: используется при загрузке старого проекта."""
+        self.integral_boundary_editor.set_active(False)
+        self._plot_views.clear()
+        self._integral_table_views.clear()
+        self._last_integral_table_context = None
         self.spectra.clear()
         self.comparisons.clear()
         self.active_spectrum_id = None
@@ -646,44 +902,11 @@ class SpectrumApp(_RootWindow):
         подряд фазировать, добавить область и удалить другую, а затем идти по
         этой единой последовательности Ctrl+Z / Ctrl+Shift+Z.
         """
-        return {
-            "phase0": float(self.phase0),
-            "phase1": float(self.phase1),
-            "phase_reference": self.phase_reference,
-            "ppm": None if self.ppm is None else self.ppm.copy(),
-            "ppm_shift": float(self.ppm_shift),
-            "corrected": None if self.corrected is None else self.corrected.copy(),
-            "integrals": [dict(item) for item in self.integrals],
-            "reference_integral_id": self.reference_integral_id,
-            "next_integral_id": int(self._next_integral_id),
-            "integration_method": self.integration_method.get(),
-            "integration_display": self.integration_display.get(),
-        }
+        return self.spectra.current.snapshot()
 
     def spectrum_state_changed(self, previous: dict[str, object]) -> bool:
         """Есть ли отличие текущего спектра от сохранённого снимка."""
-        if (
-            not np.isclose(float(previous["phase0"]), self.phase0)
-            or not np.isclose(float(previous["phase1"]), self.phase1)
-            or previous.get("phase_reference") != self.phase_reference
-            or not np.isclose(float(previous.get("ppm_shift", 0.0)), self.ppm_shift)
-            or previous.get("reference_integral_id") != self.reference_integral_id
-            or int(previous.get("next_integral_id", 1)) != self._next_integral_id
-            or previous.get("integration_method", "Обычная площадь")
-            != self.integration_method.get()
-            or previous.get("integration_display", "Площадь") != self.integration_display.get()
-            or previous.get("integrals", []) != self.integrals
-        ):
-            return True
-        before_ppm = previous.get("ppm")
-        if (before_ppm is None) != (self.ppm is None):
-            return True
-        if before_ppm is not None and not np.array_equal(np.asarray(before_ppm), self.ppm):
-            return True
-        before = previous["corrected"]
-        if (before is None) != (self.corrected is None):
-            return True
-        return before is not None and not np.array_equal(np.asarray(before), self.corrected)
+        return not same_state(previous, self.capture_spectrum_state())
 
     def clear_history(self, *, preserve_formulas: bool = False) -> None:
         """Очистить историю спектра; при переключении строк сохранить историю схемы."""
@@ -813,17 +1036,7 @@ class SpectrumApp(_RootWindow):
         return True
 
     def restore_spectrum_state(self, state: dict[str, object]) -> None:
-        self.phase0 = float(state["phase0"])
-        self.phase1 = float(state["phase1"])
-        self.phase_reference = state.get("phase_reference")  # type: ignore[assignment]
-        restored_ppm = state.get("ppm")
-        self.ppm = None if restored_ppm is None else np.asarray(restored_ppm, dtype=float).copy()
-        self.ppm_shift = float(state.get("ppm_shift", 0.0))
-        corrected = state["corrected"]
-        self.corrected = None if corrected is None else np.asarray(corrected, dtype=float).copy()
-        self.integrals = [dict(item) for item in state.get("integrals", [])]
-        self.reference_integral_id = state.get("reference_integral_id")  # type: ignore[assignment]
-        self._next_integral_id = int(state.get("next_integral_id", 1))
+        self.spectra.current.restore(state)
         self.integration_method.set(
             self.normalize_integration_method(
                 str(state.get("integration_method", "Обычная площадь"))
@@ -879,6 +1092,9 @@ class SpectrumApp(_RootWindow):
         """Отменить последнее действие над спектром, сравнением или схемой формулы."""
         if self._spectrum_dialog_open:
             return "break"
+        if self.integral_boundary_editor.cancel_drag():
+            self.status.set("Перетаскивание границы отменено.")
+            return "break"
         if not self._undo_stack:
             self.status.set("Нет действий для отмены.")
             return "break"
@@ -899,6 +1115,9 @@ class SpectrumApp(_RootWindow):
     def redo_last_action(self, _event: object | None = None) -> str:
         """Вернуть действие над спектром, сравнением или схемой формулы."""
         if self._spectrum_dialog_open:
+            return "break"
+        if self.integral_boundary_editor.cancel_drag():
+            self.status.set("Перетаскивание границы отменено.")
             return "break"
         if not self._redo_stack:
             self.status.set("Нет действий для повтора.")
@@ -944,6 +1163,7 @@ class SpectrumApp(_RootWindow):
         ]
         return {
             "name": str(record["name"]),
+            "bruker_title": clean_title(record.get("bruker_title", "")),
             "source_folder": str(record["source_folder"]),
             "phase": {
                 "p0": float(record["phase0"]),
@@ -1190,6 +1410,10 @@ class SpectrumApp(_RootWindow):
 
     def restore_project_spectrum_payload(self, payload: dict[str, object]) -> None:
         """Применить сохранённую обработку к уже загруженному активному 1r."""
+        if "bruker_title" in payload:
+            self.spectra[self.active_spectrum_id]["bruker_title"] = clean_title(
+                payload["bruker_title"]
+            )
         phase = payload.get("phase", {})
         if not isinstance(phase, dict):
             phase = {}
@@ -1270,21 +1494,12 @@ class SpectrumApp(_RootWindow):
         return phase_correct(self.real, self.imaginary, self.phase0, self.phase1, self.phase_pivot)
 
     def signal(self) -> np.ndarray:
-        return self.corrected if self.corrected is not None else self.phased_signal()
+        return current_signal(self.spectra.current)
 
     @staticmethod
     def record_signal(record: dict[str, object]) -> np.ndarray:
         """Сигнал записи библиотеки без переключения активного спектра."""
-        corrected = record.get("corrected")
-        if isinstance(corrected, np.ndarray):
-            return corrected
-        return phase_correct(
-            np.asarray(record["real"]),
-            np.asarray(record["imaginary"]),
-            float(record.get("phase0", 0.0)),
-            float(record.get("phase1", 0.0)),
-            float(record.get("phase_pivot", 0.5)),
-        )
+        return current_signal(record)
 
     def comparison_record(self) -> dict[str, object] | None:
         if self.current_comparison_id is None:
@@ -1460,6 +1675,8 @@ class SpectrumApp(_RootWindow):
         self.create_span_selector()
         self.canvas.draw_idle()
         self.save_active_spectrum()
+        if not preview:
+            self.refresh_spectrum_library()
 
     def draw_comparison(self, *, reset_x: bool = False, reset_y: bool = False) -> None:
         """Отрисовать наложение либо стек отдельных спектров на одной оси X."""
@@ -1582,6 +1799,7 @@ class SpectrumApp(_RootWindow):
         if len(ids) < 2:
             messagebox.showinfo("Несколько спектров", "Выберите хотя бы два спектра.", parent=self)
             return
+        self.integral_boundary_editor.set_active(False)
         self.save_active_spectrum()
         comparison_id = self._next_comparison_id
         self._next_comparison_id += 1
@@ -1607,6 +1825,7 @@ class SpectrumApp(_RootWindow):
         self.status.set(f"Создано {self.comparisons[comparison_id]['name']} в режиме {text}.")
 
     def shift_comparison_spectrum(self) -> None:
+        self.integral_boundary_editor.set_active(False)
         comparison = self.comparison_record()
         if comparison is None:
             messagebox.showinfo(
@@ -1622,6 +1841,7 @@ class SpectrumApp(_RootWindow):
         к одному конкретному сигналу, сначала увеличьте его колёсиком и затем
         запустите эту команду: границы текущего окна сохраняются.
         """
+        self.integral_boundary_editor.set_active(False)
         comparison = self.comparison_record()
         if comparison is None:
             messagebox.showinfo(
@@ -1718,11 +1938,17 @@ class SpectrumApp(_RootWindow):
             props={"facecolor": "#4c78a8", "alpha": 0.22},
         )
         self.span.set_active(self.integration_mode or self.x_zoom_mode)
+        editor = self.__dict__.get("integral_boundary_editor")
+        if editor is not None:
+            editor.refresh_handles()
 
     def restore_interaction_mode(self) -> None:
         """Вернуть выделение после закрытия модального окна или смены метода."""
         if self.span is not None:
-            self.span.set_active(self.integration_mode or self.x_zoom_mode)
+            editor = self.__dict__.get("integral_boundary_editor")
+            self.span.set_active(
+                (self.integration_mode or self.x_zoom_mode) and not (editor and editor.active)
+            )
 
     def zoom_y(self, event) -> None:
         active_axes = (
@@ -1761,6 +1987,7 @@ class SpectrumApp(_RootWindow):
         self.canvas.draw_idle()
 
     def toggle_x_zoom(self) -> None:
+        self.integral_boundary_editor.set_active(False)
         if self.integration_mode:
             self.integration_mode = False
             self.integration_button.configure(relief="raised")
@@ -1778,6 +2005,8 @@ class SpectrumApp(_RootWindow):
         )
 
     def on_x_selected(self, xmin: float, xmax: float) -> None:
+        if self.integral_boundary_editor.active:
+            return
         if abs(xmax - xmin) < 1e-9:
             return
         if self.integration_mode:
@@ -1787,6 +2016,8 @@ class SpectrumApp(_RootWindow):
                 self.add_integral(xmin, xmax)
             return
         self.axes.set_xlim(max(xmin, xmax), min(xmin, xmax))
+        if self.auto_y_on_switch.get():
+            self.fit_current_view_y()
         self.x_zoom_mode = False
         assert self.span is not None
         self.span.set_active(False)
@@ -1800,18 +2031,23 @@ class SpectrumApp(_RootWindow):
         elif self.ppm is not None:
             self.axes.set_xlim(float(self.ppm.max()), float(self.ppm.min()))
             self.canvas.draw_idle()
+        if self.auto_y_on_switch.get():
+            self.fit_current_view_y()
 
     def show_integral_table(self) -> None:
         """Показать таблицу вторым окном вертикального разделителя."""
         if not self._integral_table_visible:
             self.spectrum_split.add(self.table_frame, minsize=120)
             self._integral_table_visible = True
-        self.after_idle(self.apply_graph_height)
+            self.after_idle(self.apply_graph_height)
+        self.integral_table_visible.set(True)
 
     def hide_integral_table(self) -> None:
         if self._integral_table_visible:
+            self.capture_view_layout()
             self.spectrum_split.forget(self.table_frame)
             self._integral_table_visible = False
+        self.integral_table_visible.set(False)
 
     def apply_graph_height(self) -> None:
         """Установить положение разделителя в процентах от доступной высоты."""
@@ -1856,6 +2092,7 @@ class SpectrumApp(_RootWindow):
         if self.real is None and self.current_comparison_id is None:
             messagebox.showinfo("Нет спектра", "Сначала загрузите спектр.", parent=self)
             return
+        self.integral_boundary_editor.set_active(False)
         self.integration_mode = not self.integration_mode
         self.x_zoom_mode = False
         self.zoom_button.configure(relief="raised")
@@ -1878,6 +2115,15 @@ class SpectrumApp(_RootWindow):
             if self.integration_mode
             else "Режим интегрирования выключен."
         )
+
+    def toggle_integral_boundaries(self) -> None:
+        """Enable direct manipulation without also creating new integrals."""
+        if self.real is None and self.current_comparison_id is None:
+            messagebox.showinfo("Нет спектра", "Сначала загрузите спектр.", parent=self)
+            return
+        if self._spectrum_dialog_open:
+            return
+        self.integral_boundary_editor.toggle()
 
     def add_integral(self, xmin: float, xmax: float) -> None:
         left, right = min(xmin, xmax), max(xmin, xmax)
@@ -1997,8 +2243,12 @@ class SpectrumApp(_RootWindow):
 
     def ordered_integrals(self) -> list[dict[str, float | int | str]]:
         """Интегралы в заданном пользователем порядке номеров."""
+        return self.ordered_integral_items(self.integrals)
+
+    @staticmethod
+    def ordered_integral_items(items):
         return sorted(
-            self.integrals,
+            items,
             key=lambda item: (
                 int(item.get("number", 10**9)),
                 -float(item["left"]) - float(item["right"]),
@@ -2089,10 +2339,10 @@ class SpectrumApp(_RootWindow):
             self.update_integral_table(self.ordered_integrals())
         self.canvas.draw_idle()
 
-    def draw_integrals(self) -> None:
+    def draw_integrals(self, items=None) -> None:
         if self.ppm is None:
             return
-        ordered = self.ordered_integrals()
+        ordered = self.ordered_integrals() if items is None else self.ordered_integral_items(items)
         ymin, ymax = self.axes.get_ylim()
         for item in ordered:
             number = self.integral_number(item["id"])
@@ -2135,6 +2385,7 @@ class SpectrumApp(_RootWindow):
         self.update_integral_table(ordered)
 
     def update_integral_table(self, ordered: list[dict[str, float | int | str]]) -> None:
+        table_view = self._table_view_before_refresh()
         self.configure_normal_integral_table()
         for row in self.integral_table.get_children():
             self.integral_table.delete(row)
@@ -2160,11 +2411,13 @@ class SpectrumApp(_RootWindow):
                 iid=str(item["id"]),
                 values=(number, name, limits, f"{area:.6g}", relative),
             )
+        self._table_view_after_refresh(table_view)
         if hasattr(self, "formula_canvas"):
             self.refresh_formula_workspace()
 
     def configure_normal_integral_table(self) -> None:
         columns = ("number", "name", "limits", "area", "relative")
+        reset_columns = tuple(self.integral_table.cget("columns")) != columns
         if self.integration_method.get() == self.DECONVOLUTION_METHOD:
             area_heading = "Площадь Лоренца"
         else:
@@ -2181,24 +2434,33 @@ class SpectrumApp(_RootWindow):
             "relative": "Отн. площадь",
         }
         widths = {"number": 45, "name": 140, "limits": 180, "area": 160, "relative": 130}
-        self.integral_table.configure(columns=columns, show="headings")
+        if reset_columns:
+            self.integral_table.configure(columns=columns, show="headings")
         for column in columns:
             self.integral_table.heading(column, text=headings[column])
-            self.integral_table.column(column, width=widths[column], anchor="center", stretch=True)
+            if reset_columns:
+                self.integral_table.column(
+                    column, width=widths[column], anchor="center", stretch=True
+                )
 
     def update_comparison_integral_table(self, comparison: dict[str, object]) -> None:
         """Таблица обзора: одна строка на спектр, одна колонка на диапазон."""
+        table_view = self._table_view_before_refresh()
         integrals = sorted(
             list(comparison.get("integrals", [])), key=lambda item: int(item["number"])
         )
         columns = ("spectrum",) + tuple(f"i_{int(item['id'])}" for item in integrals)
-        self.integral_table.configure(columns=columns, show="headings")
+        reset_columns = tuple(self.integral_table.cget("columns")) != columns
+        if reset_columns:
+            self.integral_table.configure(columns=columns, show="headings")
         self.integral_table.heading("spectrum", text="Спектр")
-        self.integral_table.column("spectrum", width=155, anchor="w", stretch=True)
+        if reset_columns:
+            self.integral_table.column("spectrum", width=155, anchor="w", stretch=True)
         for item in integrals:
             column = f"i_{int(item['id'])}"
             self.integral_table.heading(column, text=f"I{int(item['number'])}")
-            self.integral_table.column(column, width=120, anchor="center", stretch=True)
+            if reset_columns:
+                self.integral_table.column(column, width=120, anchor="center", stretch=True)
         for row in self.integral_table.get_children():
             self.integral_table.delete(row)
         offsets = comparison.get("offsets", {})
@@ -2213,6 +2475,7 @@ class SpectrumApp(_RootWindow):
                 for item in integrals
             )
             self.integral_table.insert("", "end", iid=f"s{spectrum_id}", values=values)
+        self._table_view_after_refresh(table_view)
         if hasattr(self, "formula_canvas"):
             self.refresh_formula_workspace()
 
@@ -2436,7 +2699,7 @@ class SpectrumApp(_RootWindow):
         parent = parent or self
         if preset is None:
             filename = filedialog.askopenfilename(
-                parent=parent, title="Открыть пресет расчёта", filetypes=(("Пресет NOX", "*.json"),)
+                parent=parent, title="Открыть формулу", filetypes=(("Формула NOX", "*.json"),)
             )
             if not filename:
                 return False
@@ -2446,7 +2709,7 @@ class SpectrumApp(_RootWindow):
                 preset["name"] = entry.name
                 preset_key = entry.key
             except (OSError, ValueError, TypeError, KeyError) as error:
-                messagebox.showerror("Пресет", str(error), parent=parent)
+                messagebox.showerror("Формула", str(error), parent=parent)
                 return False
         try:
             comparison = comparison_context or self.comparison_record()
@@ -2461,7 +2724,7 @@ class SpectrumApp(_RootWindow):
         except (ValueError, TypeError, KeyError, OverflowError) as error:
             if show_error:
                 messagebox.showerror(
-                    "Пресет", f"Не удалось открыть расчёт:\n{error}", parent=parent
+                    "Формула", f"Не удалось открыть расчёт:\n{error}", parent=parent
                 )
             return False
         previous = self.capture_formula_state()
@@ -2474,13 +2737,13 @@ class SpectrumApp(_RootWindow):
             f"Выбран расчёт «{document.name}». Недостающие интегралы считаются за 0."
         )
         if show_error:
-            self.remember_formula_state(previous, "выбран пресет", preserve_preset=True)
+            self.remember_formula_state(previous, "выбрана формула", preserve_preset=True)
         return True
 
     def save_formula_preset(self, *, parent=None):
         parent = parent or self
         if not self.formula_document.blocks:
-            messagebox.showinfo("Пресет", "Сначала создайте формулу в редакторе.", parent=parent)
+            messagebox.showinfo("Формула", "Сначала создайте формулу в редакторе.", parent=parent)
             return
         directory = self.preset_library.user_directory
         suggested_name = (
@@ -2491,11 +2754,11 @@ class SpectrumApp(_RootWindow):
         )
         filename = filedialog.asksaveasfilename(
             parent=parent,
-            title="Сохранить пресет расчёта",
+            title="Сохранить формулу",
             initialdir=str(directory if directory.exists() else directory.parent),
             initialfile=suggested_name + ".json",
             defaultextension=".json",
-            filetypes=(("Пресет NOX", "*.json"),),
+            filetypes=(("Формула NOX", "*.json"),),
         )
         if not filename:
             return
@@ -2507,14 +2770,16 @@ class SpectrumApp(_RootWindow):
             )
             entry = self.preset_library.register(filename, import_copy=True)
         except (OSError, ValueError, TypeError, KeyError) as error:
-            messagebox.showerror("Пресет", f"Не удалось сохранить:\n{error}", parent=parent)
+            messagebox.showerror("Формула", f"Не удалось сохранить:\n{error}", parent=parent)
             return
         self.formula_document.name = entry.name
         self.active_preset_key = entry.key
         self.refresh_calculations()
-        self.formula_status.set(f"Пресет «{entry.name}» сохранён и добавлен в библиотеку.")
+        self.formula_status.set(f"Формула «{entry.name}» сохранена и добавлена в библиотеку.")
 
     def on_plot_click(self, event) -> None:
+        if self.integral_boundary_editor.dragging:
+            return
         if event.button != 3 or event.xdata is None:
             return
         if self.current_comparison_id is not None:
@@ -2650,6 +2915,7 @@ class SpectrumApp(_RootWindow):
         self.draw()
 
     def open_phase_dialog(self) -> None:
+        self.integral_boundary_editor.set_active(False)
         if self.current_comparison_id is not None:
             messagebox.showinfo(
                 "Фазирование",
@@ -2663,6 +2929,7 @@ class SpectrumApp(_RootWindow):
         PhaseDialog(self)
 
     def open_correction_dialog(self) -> None:
+        self.integral_boundary_editor.set_active(False)
         if self.current_comparison_id is not None:
             messagebox.showinfo(
                 "Коррекция базовой линии",

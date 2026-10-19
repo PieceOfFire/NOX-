@@ -133,10 +133,15 @@ def main():
                 if window.winfo_class() == "Toplevel":
                     window.attributes("-alpha", 0)
                     window.destroy()
+            calculation_status = app.formula_status.get()
             editor = app.open_formula_editor()
             editor.attributes("-alpha", 0)
+            assert app.formula_status.get() == calculation_status
             editor.clean_formula_scene()
+            editor.set_formula_tool("select")
+            assert app.formula_status.get() == calculation_status
             editor.close()
+            assert app.formula_status.get() == calculation_status
 
             payload = app.project_data()
             saved = folder / "project.nmrproj.json"

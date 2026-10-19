@@ -14,9 +14,10 @@ from pathlib import Path
 
 import numpy as np
 
-from base_line import find_processed_spectrum, phase_correct, read_bruker_parameters
+from base_line import find_processed_spectrum, read_bruker_parameters
 from project_store import decode_signal, encode_signal
 from baseline_policy import resolve_spin_baseline
+from spectrum_state import current_signal, same_state
 
 ARRAY_FIELDS = ("ppm", "real", "imaginary", "corrected")
 SCALAR_FIELDS = (
@@ -88,16 +89,6 @@ def unpack_data(payload):
     return result
 
 
-def same_state(a, b):
-    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
-        return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and np.array_equal(a, b)
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(same_state(a[key], b[key]) for key in a)
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(same_state(x, y) for x, y in zip(a, b))
-    return a == b
-
-
 def find_raw_source(source):
     path = Path(source).resolve()
     if path.is_file() and path.suffix.lower() == ".npz":
@@ -110,18 +101,6 @@ def find_raw_source(source):
         if (candidate / "fid").is_file() and (candidate / "acqus").is_file():
             return candidate
     raise FileNotFoundError("Не найден одномерный Bruker FID с acqus (или демо-файл NPZ).")
-
-
-def current_signal(data):
-    if data.get("corrected") is not None:
-        return np.asarray(data["corrected"])
-    return phase_correct(
-        data["real"],
-        data["imaginary"],
-        data.get("phase0", 0),
-        data.get("phase1", 0),
-        data.get("phase_pivot", 0.5),
-    )
 
 
 def base_data(record):
@@ -363,9 +342,15 @@ def fit_current(record):
     if not spin:
         return False
     expected = spin["expected"]
-    if any(record.get(key) != expected.get(key) for key in ("phase0", "phase1")):
+    if any(
+        record.get(key) != expected.get(key)
+        for key in ("phase0", "phase1", "phase_pivot", "spectral_width_hz")
+    ):
         return False
-    if not same_state(record.get("corrected"), expected.get("corrected")):
+    if any(
+        not same_state(record.get(key), expected.get(key))
+        for key in ("real", "imaginary", "corrected")
+    ):
         return False
     delta = float(record.get("ppm_shift", 0)) - float(expected.get("ppm_shift", 0))
     return np.shape(record["ppm"]) == np.shape(expected["ppm"]) and np.allclose(

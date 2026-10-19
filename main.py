@@ -21,6 +21,8 @@ def __getattr__(name):
 
 
 if __name__ == "__main__":
+    import sys
+
     from startup import launch
 
-    raise SystemExit(launch())
+    raise SystemExit(launch(timing="--startup-timing" in sys.argv[1:]))

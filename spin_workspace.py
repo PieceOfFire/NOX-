@@ -22,6 +22,8 @@ from spin_backend import (
 )
 from spin_dialog import SpinParameters
 from spin_history import WorkspaceHistory, snapshot
+from spin_review import compare_groups, comparison_curve, workspace_issues
+from baseline_policy import corrected_region
 from spintegrate.profiles import SHAPE_LABELS
 from spin_tuning import suggest_parameters
 from ui_theme import PAGE, MUTED
@@ -50,14 +52,23 @@ class SpinWorkspace(tk.Toplevel):
         self.running, self.closed = False, False
         self.revision = self.accepted_revision = 0
         self.pending = self.debounce = None
+        self.poll_id = None
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.settings = copy.deepcopy(settings)
-        self.active_sid = next(iter(records))
+        self.active_sid = job.get("initial_sid", next(iter(records)))
+        if self.active_sid not in records:
+            self.active_sid = next(iter(records))
         self.group_specs = []
         self.groups_initialized = False
         self.refreshing = False
         self.history = WorkspaceHistory()
+        self.comparison_states = {}
+        self._issue_anchors = {}
+        self._failures = {}
+        self._parameter_error = None
+        self._focused_issue = None
+        self.show_before = tk.BooleanVar(value=False)
         self._selections = {}
         self._views = {}
         self._plotted_sid = None
@@ -121,11 +132,25 @@ class SpinWorkspace(tk.Toplevel):
             self.focus_plot_button,
             "Увеличить график, свернув панели. F11 — переключить; Esc — вернуть панели.",
         )
-        ttk.Label(
+        instruction = ttk.Label(
             body,
             text="1. Проверьте подгонку.   2. Выделите сигнал на графике.   3. Дайте имя и создайте интеграл.",
             wraplength=1100,
-        ).pack(anchor="w", pady=5)
+        )
+        # The same steps are in the ordinary parameter panel. On laptop screens
+        # prefer a usable plot/table to repeating the instruction above them.
+        if screen_height >= 800:
+            instruction.pack(anchor="w", pady=5)
+        overview = ttk.Frame(body)
+        overview.pack(fill="x", pady=(0, 6))
+        self.overview = tk.StringVar(value="Подготовка области…")
+        ttk.Label(overview, textvariable=self.overview, foreground=MUTED).pack(side="left")
+        self.problems_button = tk.Button(
+            overview,
+            text="Проблемы: 0",
+            command=self.open_problems,
+        )
+        self.problems_button.pack(side="right")
         panes = tk.PanedWindow(
             body,
             orient="horizontal",
@@ -138,10 +163,12 @@ class SpinWorkspace(tk.Toplevel):
         )
         self.panes = panes
         self.parameters = SpinParameters(panes, settings, self.parameters_changed, self.auto_start)
+        self.parameters.operation_scope_size = len(self.records)
+        self.parameters.bind("<<SpinModeChanged>>", self.parameter_mode_changed)
         self.parameters.set_baseline_context(
             self.records[self.active_sid], job["left"], job["right"], self.offset(self.active_sid)
         )
-        self._parameter_width = 410
+        self._parameter_width = 300
         panes.add(self.parameters, minsize=260, width=self._parameter_width, stretch="never")
         right = ttk.Frame(panes)
         self.right = right
@@ -153,11 +180,25 @@ class SpinWorkspace(tk.Toplevel):
         self.spectrum_box = ttk.Combobox(
             header, state="readonly", width=10, values=[r["name"] for r in records.values()]
         )
-        self.spectrum_box.current(0)
+        self.spectrum_box.current(list(records).index(self.active_sid))
         self.spectrum_box.pack(side="left", padx=(0, 5))
         self.spectrum_box.bind("<<ComboboxSelected>>", self.select_spectrum)
-        tk.Button(header, text="Пересчитать", command=self.parameters_changed).pack(
-            side="right", padx=5
+        for text, direction, shortcut in (("‹", -1, "Ctrl+PageUp"), ("›", 1, "Ctrl+PageDown")):
+            button = tk.Button(
+                header, text=text, width=2, command=lambda d=direction: self.step_spectrum(d)
+            )
+            button.pack(side="left", padx=(0, 2))
+            add_tooltip(button, f"Другой спектр без изменения подгонки: {shortcut}.")
+        recalculate = tk.Button(
+            header,
+            text=f"Пересчитать серию ({len(self.records)})"
+            if len(self.records) > 1
+            else "Пересчитать",
+            command=self.parameters_changed,
+        )
+        recalculate.pack(side="right", padx=5)
+        add_tooltip(
+            recalculate, f"Общие параметры подгонки применятся к {len(self.records)} спектрам."
         )
         self.plot_split = tk.PanedWindow(
             right,
@@ -174,7 +215,8 @@ class SpinWorkspace(tk.Toplevel):
         self.plot_pane = plot_pane
         plot_pane.columnconfigure(0, weight=1)
         plot_pane.rowconfigure(0, weight=1)
-        self.plot_split.add(plot_pane, minsize=250, stretch="always")
+        self._plot_minimum = 230 if screen_height < 800 else 250
+        self.plot_split.add(plot_pane, minsize=self._plot_minimum, stretch="always")
         self.figure = Figure(figsize=(7, 4), dpi=100)
         self.top, self.residual = self.figure.subplots(
             2, 1, sharex=True, gridspec_kw={"height_ratios": [3, 1]}
@@ -240,6 +282,11 @@ class SpinWorkspace(tk.Toplevel):
             variable=self.show_components,
             command=self.plot,
         )
+        view_menu.add_checkbutton(
+            label="Наложить подгонку «До»",
+            variable=self.show_before,
+            command=self.plot,
+        )
         view_menu.add_separator()
         view_menu.add_command(
             label="Сохранить изображение графика…", command=self.navigation.save_figure
@@ -259,26 +306,32 @@ class SpinWorkspace(tk.Toplevel):
             side="right"
         )
         self.tables = ttk.Notebook(self.plot_split)
-        self.plot_split.add(self.tables, minsize=165, height=205, stretch="never")
+        self.plot_split.add(self.tables, minsize=165, height=250, stretch="never")
         self.output_tab, self.lines_tab, diagnostic_tab = (
             ttk.Frame(self.tables, padding=4) for _ in range(3)
         )
-        self.tables.add(self.output_tab, text="Итоговые интегралы")
-        self.tables.add(self.lines_tab, text="Линии модели")
-        self.tables.add(diagnostic_tab, text="Качество подгонки")
+        self.tables.add(self.output_tab, text="Интегралы")
+        self.tables.add(self.lines_tab, text="Линии")
+        self.tables.add(diagnostic_tab, text="Качество")
+        self.build_review_tabs()
         for tab in (self.output_tab, self.lines_tab):
             tab.rowconfigure(1, weight=1)
             tab.columnconfigure(0, weight=1)
         create_row = ttk.Frame(self.output_tab)
         create_row.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 3))
         ttk.Label(create_row, text="Имя:").pack(side="left")
-        ttk.Entry(create_row, textvariable=self.group_name, width=18).pack(
-            side="left", fill="x", expand=True, padx=4
-        )
+        self.group_name_entry = ttk.Entry(create_row, textvariable=self.group_name, width=18)
+        self.group_name_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.group_name_entry.bind("<Return>", self.create_group_key)
+        ttk.Label(create_row, text=self.series_scope(), foreground=MUTED).pack(side="left", padx=5)
         self.create_button = tk.Button(
             create_row, text="Создать из выбранного", command=self.create_group, state="disabled"
         )
         self.create_button.pack(side="right")
+        add_tooltip(
+            self.create_button,
+            f"Создать общий интеграл для {len(self.records)} спектров, сопоставив выбранные линии. Enter в поле имени.",
+        )
         ttk.Label(
             self.lines_tab,
             text="Это отдельные линии аппроксимации, а не готовые интегралы. Ctrl/Shift — выбрать несколько.",
@@ -321,8 +374,16 @@ class SpinWorkspace(tk.Toplevel):
         self.groups.bind("<Double-1>", self.select_group_members)
         output_actions = ttk.Frame(self.output_tab)
         output_actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        self.current_scope = tk.StringVar()
+        current_actions = ttk.LabelFrame(output_actions, padding=(3, 1))
+        current_actions.pack(side="left", padx=(0, 5))
+        current_actions.configure(
+            labelwidget=ttk.Label(
+                current_actions, textvariable=self.current_scope, foreground=MUTED
+            )
+        )
         self.replace_button = tk.Button(
-            output_actions,
+            current_actions,
             text="Заменить состав выбранным",
             command=self.assign_selected,
             state="disabled",
@@ -330,8 +391,10 @@ class SpinWorkspace(tk.Toplevel):
         self.replace_button.pack(side="left")
         add_tooltip(
             self.replace_button,
-            "Заменить линии в выделенном итоговом интеграле на текущий выбор на графике или в списке.",
+            "Заменить линии только в текущем спектре. Состав остальных спектров не изменится.",
         )
+        series_actions = ttk.LabelFrame(output_actions, text=self.series_scope(), padding=(3, 1))
+        series_actions.pack(side="left")
         self.group_actions = []
         for text, command in (
             ("Состав", self.select_group_members),
@@ -339,9 +402,18 @@ class SpinWorkspace(tk.Toplevel):
             ("Имя…", self.rename_group),
             ("Удалить", self.delete_group),
         ):
-            button = tk.Button(output_actions, text=text, command=command)
+            button = tk.Button(
+                current_actions if text == "Состав" else series_actions, text=text, command=command
+            )
             button.pack(side="left", padx=2)
             self.group_actions.append(button)
+            add_tooltip(
+                button,
+                "Показать линии выбранного интеграла в текущем спектре."
+                if text == "Состав"
+                else f"Действие относится ко всей серии: {len(self.records)} спектров."
+                + (" F2 — переименовать." if text == "Имя…" else ""),
+            )
         for table in (self.components, self.groups):
             table.grid(row=1, column=0, sticky="nsew")
             scroll = ttk.Scrollbar(table.master, orient="vertical", command=table.yview)
@@ -388,13 +460,34 @@ class SpinWorkspace(tk.Toplevel):
             "Отменить изменение в этом окне: Ctrl+Z. Также возвращает последнюю готовую подгонку при ошибке параметров.",
         )
         add_tooltip(self.redo_button, "Повторить изменение: Ctrl+Shift+Z.")
-        self.progress = ttk.Progressbar(footer, mode="indeterminate", length=80)
+        self.progress = ttk.Progressbar(
+            footer, mode="determinate", maximum=len(self.records), length=80
+        )
         self.progress.pack(side="left", padx=8)
+        self.progress_info = tk.StringVar()
+        add_tooltip(
+            self.progress,
+            lambda: (
+                self.progress_info.get()
+                + "\nПрогресс по спектрам; внутри одной подгонки процент не меняется."
+            ),
+        )
+        self.stop_button = tk.Button(
+            footer, text="Остановить", command=self.stop_fit, state="disabled"
+        )
+        self.stop_button.pack(side="left", padx=5)
+        add_tooltip(
+            self.stop_button,
+            "Отменить пересчёт и вернуть последний готовый результат. Текущий расчёт завершится в фоне и будет отброшен.",
+        )
         tk.Button(footer, text="Отмена", command=self.destroy).pack(side="right")
         self.apply_button = tk.Button(
             footer, text="Применить интегралы", command=self.apply, state="disabled"
         )
         self.apply_button.pack(side="right", padx=8)
+        from ui_theme import mark_primary
+
+        mark_primary(self.apply_button)
         # Reserve footer/diagnostics first; only the central workspace may shrink.
         status_label.pack(side="bottom", fill="x", pady=7)
         panes.pack(fill="both", expand=True)
@@ -402,16 +495,321 @@ class SpinWorkspace(tk.Toplevel):
         self.bind("<Escape>", self.escape_workspace)
         self.bind("<F11>", lambda _event: self.toggle_plot_focus() or "break")
         self.bind("<Control-KeyPress>", self.history_key)
+        self.bind("<F2>", self.rename_group_key)
+        self.bind("<Control-Next>", lambda event: self.step_spectrum(1, event))
+        self.bind("<Control-Prior>", lambda event: self.step_spectrum(-1, event))
         self.after_idle(self.initialize_plot_size)
         if self.states:
             self.initialize_groups()
+            self.capture_comparison(initial=True)
             self.refresh()
             self.remember_edit()
         else:
             self.parameters_changed()
 
+    def parameter_mode_changed(self, _event=None):
+        self._parameter_width = 420 if self.parameters.mode.get() == "expert" else 300
+        if self.parameters_visible and not self.plot_focused:
+            self.panes.paneconfigure(self.parameters, width=self._parameter_width)
+        self.schedule_plot_layout()
+
+    def build_review_tabs(self):
+        self.problems_tab = ttk.Frame(self.tables, padding=6)
+        self.comparison_tab = ttk.Frame(self.tables, padding=6)
+        self.tables.add(self.problems_tab, text="Проблемы")
+        self.tables.add(self.comparison_tab, text="До / после")
+        for tab in (self.problems_tab, self.comparison_tab):
+            tab.columnconfigure(0, weight=1)
+            tab.rowconfigure(1, weight=1)
+        ttk.Label(
+            self.problems_tab,
+            text="Нажмите на строку — откроется нужный спектр и проблемный участок.",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.problem_table = ttk.Treeview(
+            self.problems_tab,
+            columns=("spectrum", "group", "message"),
+            show="headings",
+            height=4,
+            selectmode="browse",
+        )
+        for key, title, width in (
+            ("spectrum", "Спектр", 100),
+            ("group", "Интеграл", 130),
+            ("message", "Что проверить", 320),
+        ):
+            self.problem_table.heading(key, text=title)
+            self.problem_table.column(key, width=width, minwidth=70)
+        self.problem_table.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(self.problems_tab, command=self.problem_table.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        self.problem_table.configure(yscrollcommand=scroll.set)
+        self.problem_table.bind("<ButtonRelease-1>", self.focus_selected_problem)
+        self.problem_table.bind("<Return>", self.focus_selected_problem)
+        self.problem_hint = tk.StringVar(value="Проблем не обнаружено. Проверьте остаток подгонки.")
+        hint_label = ttk.Label(
+            self.problems_tab, textvariable=self.problem_hint, wraplength=650, foreground=MUTED
+        )
+        hint_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.problems_tab.bind(
+            "<Configure>", lambda event: hint_label.configure(wraplength=max(220, event.width - 12))
+        )
+        comparison_controls = ttk.Frame(self.comparison_tab)
+        comparison_controls.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        ttk.Checkbutton(
+            comparison_controls,
+            text="Наложить «До» на график",
+            variable=self.show_before,
+            command=self.plot,
+        ).pack(side="left")
+        self.pin_comparison_button = tk.Button(
+            comparison_controls,
+            text="Текущая → «До»",
+            command=self.capture_comparison,
+            state="disabled",
+        )
+        self.pin_comparison_button.pack(side="right")
+        add_tooltip(
+            self.pin_comparison_button,
+            "Зафиксировать готовую подгонку всей серии как точку сравнения. "
+            "Настройки, интегралы и история не меняются.",
+        )
+        self.comparison_table = ttk.Treeview(
+            self.comparison_tab,
+            columns=("name", "before", "after", "delta", "note"),
+            show="headings",
+            height=4,
+            selectmode="extended",
+        )
+        for key, title, width in (
+            ("name", "Интеграл", 140),
+            ("before", "До · площадь", 105),
+            ("after", "После · площадь", 105),
+            ("delta", "Δ площади, %", 100),
+            ("note", "Сопоставление", 230),
+        ):
+            self.comparison_table.heading(key, text=title)
+            self.comparison_table.column(key, width=width, minwidth=70)
+        self.comparison_table.grid(row=1, column=0, sticky="nsew")
+        cscroll = ttk.Scrollbar(self.comparison_tab, command=self.comparison_table.yview)
+        cscroll.grid(row=1, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(
+            self.comparison_tab, orient="horizontal", command=self.comparison_table.xview
+        )
+        horizontal.grid(row=2, column=0, sticky="ew")
+        self.comparison_table.configure(yscrollcommand=cscroll.set, xscrollcommand=horizontal.set)
+        self.comparison_table.bind("<Control-KeyPress>", self.copy_comparison)
+        self.comparison_hint = tk.StringVar(value="«До» появится после первой готовой подгонки.")
+        comparison_hint_label = ttk.Label(
+            self.comparison_tab, textvariable=self.comparison_hint, wraplength=650, foreground=MUTED
+        )
+        comparison_hint_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.comparison_tab.bind(
+            "<Configure>",
+            lambda event: comparison_hint_label.configure(wraplength=max(220, event.width - 12)),
+        )
+
+    def copy_comparison(self, event):
+        if event.keysym.lower() in ("c", "cyrillic_es") or event.keycode == 67:
+            return self.app.copy_treeview_rows(self.comparison_table, context="spintegrate")
+
+    def capture_comparison(self, initial=False):
+        if not self.states or (not initial and not self.ready()):
+            return
+        self.comparison_states = snapshot(
+            self.states, self.settings, self.group_specs, self._whole_area_group_id
+        )["states"]
+        self.comparison_hint.set(
+            "«До» зафиксировано: стартовая подгонка. Δ% — изменение площади, не точность измерения."
+            if initial
+            else "«До» обновлено для всей серии. Δ% — изменение площади, не точность измерения."
+        )
+        self.update_comparison()
+        if not initial:
+            self.plot()
+
+    def update_comparison(self):
+        self.pin_comparison_button.configure(state="normal" if self.ready() else "disabled")
+        self.comparison_table.delete(*self.comparison_table.get_children())
+
+        def number(value):
+            return "—" if value is None else f"{value:.6g}"
+
+        for row in compare_groups(
+            self.comparison_states.get(self.active_sid),
+            self.states.get(self.active_sid),
+            absolute=self.absolute(),
+        ):
+            self.comparison_table.insert(
+                "",
+                "end",
+                iid=row["id"],
+                values=(
+                    row["name"],
+                    number(row["before"]),
+                    number(row["after"]),
+                    "—" if row["delta_pct"] is None else f"{row['delta_pct']:+.2f}%",
+                    row["note"],
+                ),
+            )
+
+    def update_problems(self):
+        for sid, state in self.states.items():
+            for group in state.get("groups", []):
+                if not group.get("missing", 0):
+                    self._issue_anchors[(sid, group["id"])] = candidate_centers(state)[
+                        group["components"]
+                    ].copy()
+        self.issues = workspace_issues(
+            self.records,
+            self.states,
+            failures=self._failures,
+            parameter_error=self._parameter_error,
+            anchors=self._issue_anchors,
+            offsets=self.offsets,
+        )
+        self.problem_table.delete(*self.problem_table.get_children())
+        for index, issue in enumerate(self.issues):
+            record = self.records.get(issue["sid"], {})
+            group = next(
+                (
+                    g
+                    for g in self.states.get(issue["sid"], {}).get("groups", [])
+                    if g["id"] == issue["group_id"]
+                ),
+                {},
+            )
+            self.problem_table.insert(
+                "",
+                "end",
+                iid=str(index),
+                values=(
+                    record.get("name", "Параметры"),
+                    group.get("name", "—"),
+                    f"{issue['severity']}: {issue['message']}",
+                ),
+            )
+            if self._focused_issue and all(
+                issue.get(key) == self._focused_issue.get(key)
+                for key in ("kind", "sid", "group_id")
+            ):
+                self.problem_table.selection_set(str(index))
+        count = len(self.issues)
+        self.problems_button.configure(text=f"Проблемы: {count}" + (" →" if count else ""))
+        self.tables.tab(self.problems_tab, text=f"Проблемы ({count})")
+        if not count:
+            self._focused_issue = None
+            self.problem_hint.set("Проблем не обнаружено. Проверьте остаток подгонки.")
+        else:
+            self.problem_hint.set(
+                self._focused_issue["action"]
+                if self._focused_issue
+                else "Нажмите на предупреждение. Неназначенные линии можно исключать намеренно."
+            )
+
+    def open_problems(self):
+        if self.plot_focused:
+            self.toggle_plot_focus()
+        self.tables.select(self.problems_tab)
+        if self.problem_table.get_children():
+            self.problem_table.selection_set(self.problem_table.get_children()[0])
+            self.focus_selected_problem()
+
+    def focus_selected_problem(self, _event=None):
+        selected = self.problem_table.selection()
+        if not selected:
+            return
+        issue = self.issues[int(selected[0])]
+        self._focused_issue = issue
+        sid = issue["sid"]
+        if sid in self.records:
+            self.spectrum_box.current(list(self.records).index(sid))
+            self.select_spectrum()
+            gid = issue["group_id"]
+            if gid and self.groups.exists(gid):
+                self.groups.selection_set(gid)
+                self.select_group_members()
+            elif issue.get("indices"):
+                self.components.selection_set([str(i) for i in issue["indices"]])
+            self.plot()
+            centers = np.asarray(issue.get("centers", [])) + self.offset(sid)
+            if len(centers):
+                low, high = float(centers.min()), float(centers.max())
+                padding = max(0.012, 0.25 * (high - low))
+                self.top.set_xlim(high + padding, low - padding)
+                self.canvas.draw_idle()
+            elif issue["kind"] == "missing":
+                self.fit_plot()
+        if issue["kind"] in ("parameter", "fit", "empty"):
+            self.parameters.set_mode("expert")
+            if not self.parameters_visible:
+                self.toggle_parameters()
+            if issue["kind"] == "parameter":
+                for key, label in self.parameters.labels.items():
+                    entry = self.parameters.entries.get(key)
+                    if entry is not None and label in issue["message"]:
+                        parent = entry
+                        while parent is not self.parameters:
+                            page = next(
+                                (p for p in self.parameters.pages if p.body is parent), None
+                            )
+                            if page is not None:
+                                self.parameters.tabs.select(page)
+                                self.after_idle(lambda p=page, e=entry: self.reveal_parameter(p, e))
+                                break
+                            parent = parent.master
+                        entry.focus_set()
+                        break
+        self.problem_hint.set(issue["action"])
+        self.status.set(issue["message"] + " " + issue["action"])
+        self.tables.select(self.problems_tab)
+
+    @staticmethod
+    def reveal_parameter(page, entry):
+        position = entry.winfo_rooty() - page.body.winfo_rooty() - 12
+        page.canvas.yview_moveto(max(0, position / max(1, page.body.winfo_height())))
+        entry.focus_set()
+
     def offset(self, sid):
         return float(self.offsets.get(sid, self.offsets.get(str(sid), 0)))
+
+    def series_scope(self):
+        return f"Вся серия · {len(self.records)}" if len(self.records) > 1 else "Один спектр"
+
+    @staticmethod
+    def text_entry_event(event):
+        if event is None:
+            return False
+        return event.widget.winfo_class() in (
+            "Entry",
+            "TEntry",
+            "Spinbox",
+            "TSpinbox",
+            "Text",
+            "TCombobox",
+            "Combobox",
+        )
+
+    def create_group_key(self, _event=None):
+        self.create_group()
+        return "break"
+
+    def rename_group_key(self, event=None):
+        if self.text_entry_event(event):
+            return None
+        self.rename_group()
+        return "break"
+
+    def step_spectrum(self, direction, event=None):
+        # Do not steal editing/navigation keys from a parameter, name or text field.
+        if self.text_entry_event(event):
+            return None
+        ids = list(self.records)
+        position = ids.index(self.active_sid)
+        target = min(len(ids) - 1, max(0, position + int(direction)))
+        if position != target:
+            self.spectrum_box.current(target)
+            self.select_spectrum()
+        return "break"
 
     def history_key(self, event):
         # Windows physical Z also works with the Russian keyboard layout.
@@ -433,6 +831,7 @@ class SpinWorkspace(tk.Toplevel):
         self.redo_button.configure(
             state="normal" if self.ready() and self.history.can_redo else "disabled"
         )
+        self.stop_button.configure(state="disabled" if self.ready() else "normal")
 
     def restore_edit(self, item):
         if item is None:
@@ -450,9 +849,37 @@ class SpinWorkspace(tk.Toplevel):
         self._whole_area_group_id = restored["whole_area_id"]
         self.parameters.set_recipe(self.settings, notify=False)
         self._selections.clear()
+        self._failures = {}
+        self._parameter_error = None
+        self._focused_issue = None
         self.progress.stop()
+        self.progress.configure(value=0)
+        self.progress_info.set("Возвращён готовый результат")
         self.refresh(preserve_selection=False)
         self.update_history_buttons()
+
+    def stop_fit(self):
+        """Cancel by revision, never interrupt SciPy while it owns model arrays."""
+        if self.ready():
+            return
+        if self.history.current is not None:
+            self.restore_edit(self.history.current)
+            self.status.set(
+                "Пересчёт отменён. Восстановлены настройки и последний готовый результат."
+            )
+        else:
+            self.revision += 1
+            self.pending = None
+            if self.debounce:
+                self.after_cancel(self.debounce)
+                self.debounce = None
+            self.progress.configure(value=0)
+            self.progress_info.set("Остановлено")
+            self.stop_button.configure(state="disabled")
+            self.status.set("Подгонка остановлена. Измените параметры или нажмите «Пересчитать».")
+            self.overview.set("Нет готовой подгонки — пересчёт остановлен")
+        if self.running:
+            self.progress_info.set("Остановлено · текущий расчёт завершится в фоне")
 
     def undo_edit(self):
         self.restore_edit(self.history.undo() if self.ready() else self.history.current)
@@ -484,8 +911,8 @@ class SpinWorkspace(tk.Toplevel):
             return
         self._layout_initialized = True
         height = self.plot_split.winfo_height()
-        table_height = min(220, max(200, int(height * 0.28)))
-        self.plot_split.sash_place(0, 0, max(250, height - table_height - 8))
+        table_height = min(300, max(250, int(height * 0.32)))
+        self.plot_split.sash_place(0, 0, max(self._plot_minimum, height - table_height - 8))
         self.layout_plot()
 
     def schedule_plot_layout(self, _event=None):
@@ -602,6 +1029,12 @@ class SpinWorkspace(tk.Toplevel):
             return
         self.revision += 1
         self.pending = None
+        self._parameter_error = None
+        self._failures = {}
+        self._focused_issue = None
+        self.pin_comparison_button.configure(state="disabled")
+        self.update_problems()
+        self.overview.set("Пересчёт — на графике и в сравнении пока предыдущий результат")
         self.apply_button.configure(state="disabled")
         self.create_button.configure(state="disabled")
         self.replace_button.configure(state="disabled")
@@ -611,7 +1044,8 @@ class SpinWorkspace(tk.Toplevel):
             "Пересчёт… На графике пока предыдущая подгонка; сохранение станет доступно после обновления."
         )
         self.fit_score.set("R²: — (пересчёт)")
-        self.progress.start(12)
+        self.progress.configure(value=0)
+        self.progress_info.set(f"Ожидание · {len(self.records)} спектров")
         self.update_history_buttons()
         if self.debounce:
             self.after_cancel(self.debounce)
@@ -623,6 +1057,9 @@ class SpinWorkspace(tk.Toplevel):
             settings = self.parameters.collect_recipe()
         except (ValueError, OverflowError) as error:
             self.progress.stop()
+            self.progress_info.set("Проверьте параметры")
+            self._parameter_error = str(error)
+            self.update_problems()
             self.status.set(
                 f"Проверьте параметры: {error} Предыдущая подгонка сохранена. «Назад» — вернуть её настройки."
             )
@@ -642,12 +1079,13 @@ class SpinWorkspace(tk.Toplevel):
 
         def worker():
             outputs, failures = {}, {}
-            for sid, record in records.items():
+            for index, (sid, record) in enumerate(records.items()):
                 if stop.is_set():
                     return
                 # Skip the rest of an obsolete series; the current solver finishes safely.
                 if revision != self.revision:
                     break
+                events.put(("progress", revision, index, len(records), sid))
                 try:
                     offset = float(offsets.get(sid, offsets.get(str(sid), 0)))
                     outputs[sid] = run_selected_region(
@@ -655,28 +1093,47 @@ class SpinWorkspace(tk.Toplevel):
                     )
                 except Exception as error:
                     failures[sid] = str(error)
-            events.put((revision, settings, outputs, failures))
+            events.put(("result", revision, settings, outputs, failures))
 
         threading.Thread(target=worker, daemon=True, name="himera-live-fit").start()
 
     def poll(self):
         if self.closed:
             return
-        try:
-            revision, settings, outputs, failures = self.events.get_nowait()
-        except queue.Empty:
-            pass
-        else:
+        while True:
+            try:
+                kind, revision, settings, outputs, failures = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "progress":
+                if revision == self.revision:
+                    completed, total, sid = settings, outputs, failures
+                    self.progress.configure(value=completed, maximum=total)
+                    name = str(self.records[sid]["name"])
+                    self.progress_info.set(f"Спектр {completed + 1}/{total} · {name[:50]}")
+                    self.status.set(
+                        f"Подгонка спектра {completed + 1}/{total}: {name}. "
+                        "На графике пока предыдущий результат."
+                    )
+                continue
             self.running = False
             if revision == self.revision:
                 self.progress.stop()
+                self.progress.configure(value=len(self.records))
+                self.progress_info.set(f"Обработано: {len(self.records)}/{len(self.records)}")
+                self.stop_button.configure(state="disabled")
                 if failures:
+                    self._failures = failures
+                    self.update_problems()
+                    self.overview.set("Подгонка не готова — откройте список проблем")
                     self.status.set(
                         "Подгонка не готова: "
                         + "; ".join(f"{self.records[s]['name']}: {e}" for s, e in failures.items())
                         + " · «Назад» возвращает последнюю готовую подгонку."
                     )
                 else:
+                    self._failures = {}
+                    self._parameter_error = None
                     self.remember_selection()
                     for sid, state in outputs.items():
                         if sid in self.states:
@@ -684,6 +1141,8 @@ class SpinWorkspace(tk.Toplevel):
                     self.states, self.settings = outputs, settings
                     self.accepted_revision = revision
                     self.initialize_groups()
+                    if not self.comparison_states:
+                        self.capture_comparison(initial=True)
                     self.refresh(preserve_selection=False)
                     self.remember_edit()
             self.launch()
@@ -851,7 +1310,10 @@ class SpinWorkspace(tk.Toplevel):
         if not spec:
             return
         name = simpledialog.askstring(
-            "Интеграл", "Название:", initialvalue=spec["name"], parent=self
+            "Интеграл",
+            f"Название · {self.series_scope().lower()}:",
+            initialvalue=spec["name"],
+            parent=self,
         )
         if name and name.strip():
             if any(s["id"] != gid and s["name"] == name.strip() for s in self.group_specs):
@@ -911,7 +1373,7 @@ class SpinWorkspace(tk.Toplevel):
             wraplength=430,
             justify="left",
             text="Все компоненты выбранного интеграла будут подогнаны этой формой вместе с остальной областью. "
-            "В серии выбор применяется к этому интегралу каждого спектра.\n\n"
+            f"Выбор применяется к этому интегралу во всей серии: {len(self.records)} спектров.\n\n"
             "Асимметричный профиль меняет левую и правую ширины. Voigt с дисперсией учитывает небольшую "
             "общую фазовую примесь; это не фазирование спектра.\n\n"
             "Площади пересчитаются. Проверяйте остаток и устойчивость результата, а не только R².",
@@ -950,6 +1412,8 @@ class SpinWorkspace(tk.Toplevel):
         if preserve_selection:
             self.remember_selection()
         self.refreshing = True
+        name = str(self.records[self.active_sid]["name"])
+        self.current_scope.set(f"Только текущий · {name[:36]}{'…' if len(name) > 36 else ''}")
         group_id = group_id or self.selected_group()
         self.components.delete(*self.components.get_children())
         self.groups.delete(*self.groups.get_children())
@@ -1006,6 +1470,11 @@ class SpinWorkspace(tk.Toplevel):
             elif state["groups"]:
                 self.groups.selection_set(state["groups"][0]["id"])
             self.summarize()
+        else:
+            self.update_problems()
+            self.update_comparison()
+            self.fit_score.set("R²: — (подгонка не готова)")
+            self.overview.set("Нет готовой модели для выбранного спектра")
         self.refreshing = False
         self.plot()
 
@@ -1023,8 +1492,29 @@ class SpinWorkspace(tk.Toplevel):
         score_text = "— (не определён)" if r2 is None else f"{100 * r2:.2f} %"
         self.fit_score.set(f"R²: {score_text}")
         count = len(self.group_specs)
-        self.tables.tab(self.output_tab, text=f"Итоговые интегралы ({count})")
-        self.tables.tab(self.lines_tab, text=f"Линии модели ({len(model['centers'])})")
+        local = bool(np.any(model["baseline"]))
+        record = self.records[self.active_sid]
+        nox = corrected_region(
+            record, self.job["left"], self.job["right"], self.offset(self.active_sid)
+        )
+        background = (
+            "NOX + локальный"
+            if local and nox
+            else "локальный"
+            if local
+            else "NOX"
+            if nox
+            else "без вычитания"
+        )
+        if not nox and record.get("corrected") is not None:
+            background += " (NOX: не вся область)"
+        self.overview.set(
+            f"Фон: {background}  ·  Линий: {len(model['centers'])}  ·  Интегралов: {count}"
+        )
+        self.update_problems()
+        self.update_comparison()
+        self.tables.tab(self.output_tab, text=f"Интегралы ({count})")
+        self.tables.tab(self.lines_tab, text=f"Линии ({len(model['centers'])})")
         self.status.set(
             f"Линий модели: {len(model['centers'])}. Итоговых интегралов: {count}. Не включено линий: {unassigned}. "
             + (
@@ -1056,6 +1546,7 @@ class SpinWorkspace(tk.Toplevel):
             text=f"Сохранить итоговые интегралы: {count}",
         )
         if not self.ready():
+            self.overview.set("Настройки не применены — показан предыдущий результат")
             self.fit_score.set("R²: — (предыдущая подгонка)")
             self.status.set(
                 "Настройки ещё не применены. На графике предыдущая подгонка. Исправьте параметры или нажмите «Назад»."
@@ -1140,7 +1631,27 @@ class SpinWorkspace(tk.Toplevel):
         tk.Button(window, text="Понятно", command=window.destroy).pack(pady=(0, 12))
 
     def plot(self):
-        if self.refreshing or not self.states.get(self.active_sid):
+        if self.refreshing:
+            return
+        if not self.states.get(self.active_sid):
+            if self.component_selector is not None:
+                self.component_selector.disconnect_events()
+                self.component_selector = None
+            self.top.clear()
+            self.residual.clear()
+            self.component_artists.clear()
+            self.group_artists.clear()
+            self.top.text(
+                0.5,
+                0.5,
+                "Подгонка этого спектра не готова",
+                ha="center",
+                va="center",
+                transform=self.top.transAxes,
+                color=MUTED,
+            )
+            self.layout_plot()
+            self.canvas.draw_idle()
             return
         self.update_selection_ui()
         state = self.states[self.active_sid]
@@ -1165,6 +1676,25 @@ class SpinWorkspace(tk.Toplevel):
             x, model["corrected"], color="#4c78a8", lw=1, label="Сигнал после локальной линии"
         )
         self.top.plot(x, model["fitted"], color="#f28e2b", ls="--", lw=1.4, label="Общая подгонка")
+        before = self.comparison_states.get(self.active_sid)
+        if self.show_before.get() and before:
+            self.top.plot(
+                x,
+                comparison_curve(before, state),
+                color="#7657a0",
+                ls=":",
+                lw=1.6,
+                label="До · в текущей шкале фона",
+            )
+        if self._focused_issue and self._focused_issue["sid"] == self.active_sid:
+            for center in self._focused_issue.get("centers", []):
+                self.top.axvline(
+                    center + self.offset(self.active_sid),
+                    color="#b45309",
+                    lw=1.3,
+                    ls=":",
+                    alpha=0.85,
+                )
         selected = set(self.selected_indices())
         group_colors = {
             s["id"]: self.COLORS[n % len(self.COLORS)] for n, s in enumerate(self.group_specs)

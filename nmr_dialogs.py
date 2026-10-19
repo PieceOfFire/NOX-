@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import tkinter as tk
 from tkinter import messagebox, ttk
 from ui_theme import PAGE, BORDER, TEXT, MUTED
+from ui_helpers import fit_combobox_popup
 from baseline_methods import (
     QUICK_METHODS,
     MORE_OPTIONS,
@@ -34,6 +35,17 @@ from base_line import (
 
 if TYPE_CHECKING:
     from main import SpectrumApp
+
+
+def parse_phase_value(value: object) -> float:
+    """Validate the displayed value rather than reusing the last valid phase."""
+    try:
+        phase = float(str(value).strip().replace(",", "."))
+    except (ValueError, TypeError) as error:
+        raise ValueError("Введите число в градусах.") from error
+    if not np.isfinite(phase):
+        raise ValueError("Значение должно быть конечным: NaN и ∞ недопустимы.")
+    return phase
 
 
 class ShiftSpectrumDialog(tk.Toplevel):
@@ -309,11 +321,13 @@ class PhaseDialog(tk.Toplevel):
 
         fields = tk.Frame(frame)
         fields.pack(fill="x", pady=(8, 0))
+        self.phase_entries = []
+        self.validation_error = tk.StringVar()
         for row, (label, value) in enumerate(
             (("Фаза 0-го порядка, °", self.p0), ("Фаза 1-го порядка, °", self.p1))
         ):
             tk.Label(fields, text=label).grid(row=row, column=0, sticky="w", pady=2)
-            tk.Spinbox(
+            entry = tk.Spinbox(
                 fields,
                 textvariable=value,
                 from_=-720,
@@ -321,20 +335,30 @@ class PhaseDialog(tk.Toplevel):
                 increment=0.01,
                 width=11,
                 command=self.update,
-            ).grid(row=row, column=1, padx=8)
+                highlightthickness=1,
+            )
+            entry.grid(row=row, column=1, padx=8)
+            self.phase_entries.append((entry, entry.cget("background")))
             value.trace_add("write", lambda *_: self.update())
+        tk.Label(
+            frame, textvariable=self.validation_error, fg="#b42318", wraplength=340, justify="left"
+        ).pack(fill="x", pady=(4, 0))
         buttons = tk.Frame(frame)
         buttons.pack(anchor="e", pady=(10, 0))
         tk.Button(buttons, text="Автофаза", command=self.auto_phase).pack(side="left", padx=4)
-        tk.Button(buttons, text="Готово", command=self.done).pack(side="left", padx=4)
+        self.done_button = tk.Button(buttons, text="Готово", command=self.done)
+        self.done_button.pack(side="left", padx=4)
         tk.Button(buttons, text="Отмена", command=self.cancel).pack(side="left")
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.update_label()
 
     def start_drag(self, event) -> None:
+        values = self.phase_values()
+        if values is None:
+            return
         self.drag_start_y = event.y
         self.drag_mode = "p1" if event.state & 0x0001 else "p0"
-        self.drag_start_phase = self.p1.get() if self.drag_mode == "p1" else self.p0.get()
+        self.drag_start_phase = values[1] if self.drag_mode == "p1" else values[0]
 
     def drag(self, event) -> None:
         if self.drag_start_y is None:
@@ -381,23 +405,70 @@ class PhaseDialog(tk.Toplevel):
         self.p1.set(phase1)
         self.value_label.set(f"φ₀ = {phase0:.2f}°     φ₁ = {phase1:.2f}°  (авто)")
 
+    def phase_values(self):
+        """Read raw Tcl text: DoubleVar.get() can reject NaN or obscure bad input."""
+        values, errors = [], []
+        for index, variable in enumerate((self.p0, self.p1)):
+            try:
+                values.append(parse_phase_value(self.tk.globalgetvar(str(variable))))
+            except ValueError as error:
+                errors.append(f"φ{index}: {error}")
+                valid = False
+            else:
+                valid = True
+            if index < len(self.phase_entries):
+                entry, background = self.phase_entries[index]
+                entry.configure(
+                    background=background if valid else "#fff1f2",
+                    highlightbackground=BORDER if valid else "#b42318",
+                    highlightcolor=BORDER if valid else "#b42318",
+                )
+        if not errors and not np.isfinite(
+            values[0] - values[1] * (self.reference_pivot - self.app.phase_pivot)
+        ):
+            errors.append("Значения фазы слишком велики: уменьшите φ₀ или φ₁.")
+            for entry, _background in self.phase_entries:
+                entry.configure(
+                    background="#fff1f2", highlightbackground="#b42318", highlightcolor="#b42318"
+                )
+        self.validation_error.set("\n".join(errors))
+        if hasattr(self, "done_button"):
+            self.done_button.configure(state="disabled" if errors else "normal")
+        return None if errors else tuple(values)
+
     def update(self) -> None:
-        try:
-            phase0_at_reference, phase1 = self.p0.get(), self.p1.get()
-        except tk.TclError:
+        values = self.phase_values()
+        if values is None:
             return
-        self.app.phase1 = phase1
-        self.app.phase0 = phase0_at_reference - phase1 * (
-            self.reference_pivot - self.app.phase_pivot
-        )
+        phase0_at_reference, phase1 = values
+        phase0 = phase0_at_reference - phase1 * (self.reference_pivot - self.app.phase_pivot)
+        if np.isclose(phase0, self.app.phase0, rtol=0, atol=1e-12) and np.isclose(
+            phase1, self.app.phase1, rtol=0, atol=1e-12
+        ):
+            self.update_label()
+            return
+        self.app.phase1, self.app.phase0 = phase1, phase0
         self.app.corrected = None
         self.app.draw()
         self.update_label()
 
     def update_label(self) -> None:
-        self.value_label.set(f"φ₀ = {self.p0.get():.2f}°     φ₁ = {self.p1.get():.2f}°")
+        values = self.phase_values()
+        if values is not None:
+            self.value_label.set(f"φ₀ = {values[0]:.2f}°     φ₁ = {values[1]:.2f}°")
 
     def done(self) -> None:
+        if self.phase_values() is None:
+            for entry, _background in self.phase_entries:
+                try:
+                    parse_phase_value(entry.get())
+                except ValueError:
+                    entry.focus_set()
+                    break
+            return
+        # Re-read and apply the values displayed now, never a stale valid preview.
+        self.update()
+        spectrum_id = self.app.active_spectrum_id
         record = self.app.spectra.get(self.app.active_spectrum_id)
         if record is not None and self.app.corrected is None:
             record["baseline_steps"] = []
@@ -407,12 +478,19 @@ class PhaseDialog(tk.Toplevel):
         self.app.draw()
         self.app._spectrum_dialog_open = False
         self.destroy()
+        callback = getattr(self.app, "on_manual_phase_committed", None)
+        if callable(callback):
+            self.app.after_idle(lambda: callback(spectrum_id))
 
     def cancel(self) -> None:
+        spectrum_id = self.app.active_spectrum_id
         self.app.restore_spectrum_state(self.previous_state)
         self.app.draw()
         self.app._spectrum_dialog_open = False
         self.destroy()
+        callback = getattr(self.app, "on_manual_phase_cancelled", None)
+        if callable(callback):
+            callback(spectrum_id)
 
 
 class CorrectionDialog(tk.Toplevel):
@@ -426,14 +504,14 @@ class CorrectionDialog(tk.Toplevel):
         self.grab_set()
         self.resizable(False, False)
         self.method = tk.StringVar(value="Адаптивный arPLS")
-        self.method_display = tk.StringVar(value=self.method.get())
+        self.method_display = tk.StringVar(value=method_label(self.method.get()))
         self.extended_settings = {key: value for key, (_, value) in FIELDS.items()}
         self.polarity = tk.StringVar(value="Авто")
         self.filter_hz, self.smoothness = tk.StringVar(), tk.StringVar()
         self._job: str | None = None
         self._post_job = None
         self.methods_expanded = False
-        self.method_values = {label: label for label in QUICK_METHODS}
+        self.method_values = {method_label(method): method for method in QUICK_METHODS}
         self.method_values.update({label: PREFIX + key for key, label in EXTENDED_METHODS.items()})
         self.manual_widgets: list[tk.Widget] = []
         frame = tk.Frame(self, padx=12, pady=12)
@@ -443,11 +521,12 @@ class CorrectionDialog(tk.Toplevel):
             frame,
             textvariable=self.method_display,
             state="readonly",
-            width=27,
-            values=(*QUICK_METHODS, MORE_OPTIONS),
+            width=44,
+            values=(*(method_label(method) for method in QUICK_METHODS), MORE_OPTIONS),
         )
         self.method_box.grid(row=0, column=1, columnspan=2, pady=3)
         self.method_box.bind("<<ComboboxSelected>>", self.on_method_changed)
+        self.method_box.configure(postcommand=lambda: fit_combobox_popup(self.method_box))
         self.auto_button = tk.Button(frame, text="Авто", command=self.set_auto)
         self.auto_button.grid(row=1, column=0, sticky="w", pady=5)
         self.manual_widgets.append(self.auto_button)
@@ -618,9 +697,9 @@ class CorrectionDialog(tk.Toplevel):
             if self._extended_notes:
                 text += "\n" + "\n".join(self._extended_notes)
         elif self.method.get() == "Сглаживающий spline":
-            text = "Spline: автоматическая коррекция без ручных параметров."
+            text = "Сглаживающий сплайн: автоматическая коррекция без ручных параметров."
         elif self.method.get() == "Адаптивный arPLS":
-            text = "arPLS: адаптивная робастная коррекция широкого фона."
+            text = "Адаптивная робастная коррекция широкого фона."
         else:
             text = f"{self.method.get()}: {f:.4g} Гц; сглаживание {s:g}."
         self.note.set(text + "\nПостроение выполнено только по текущему диапазону X.")

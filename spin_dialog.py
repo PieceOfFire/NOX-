@@ -7,7 +7,8 @@ from tkinter import messagebox, ttk
 import math
 from spin_backend import default_recipe, engine
 from spin_tuning import PARAMETERS, adjusted_value, suggest_parameters
-from ui_helpers import add_tooltip
+from ui_helpers import add_tooltip, fit_combobox_popup
+from baseline_methods import EXTENDED_METHODS
 from dataclasses import asdict
 from spintegrate.profiles import SHAPE_LABELS
 from spin_controls import ParameterPage
@@ -19,7 +20,7 @@ PEAK_LABELS = {"prominence": "По выраженности (шумоустой�
 class SpinParameters(ttk.Frame):
     """Shared parameter controls for initial selection and live fitting."""
 
-    def __init__(self, parent, recipe=None, on_change=None, on_auto=None):
+    def __init__(self, parent, recipe=None, on_change=None, on_auto=None, *, on_mode_change=None):
         core = engine()
         self.recipe = copy.deepcopy(recipe) if recipe else default_recipe()
         self.recipe.setdefault(
@@ -34,14 +35,30 @@ class SpinParameters(ttk.Frame):
         self.entries = {}
         self.labels = {}
         self.on_change, self.on_auto = on_change, on_auto
+        self.operation_scope_size = 1
+        self.on_mode_change = on_mode_change
+        self.mode = tk.StringVar(self, value="ordinary")
         self._updating = False
         self._baseline_context = None
         self.wheel_remainder = {}
         body = ttk.Frame(self, padding=8)
         body.pack(fill="both", expand=True)
+        mode_bar = ttk.Frame(body)
+        mode_bar.pack(fill="x", pady=(0, 12))
+        ttk.Label(mode_bar, text="Режим", font="AppHeadingFont").pack(side="left")
+        self.mode_buttons = {}
+        for value, caption in (("ordinary", "Обычный"), ("expert", "Экспертный")):
+            control = ttk.Radiobutton(
+                mode_bar,
+                text=caption,
+                variable=self.mode,
+                value=value,
+            )
+            control.pack(side="left", padx=(12, 0))
+            self.mode_buttons[value] = control
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(0, 4))
-        self.auto_button = tk.Button(
+        self.auto_button = ttk.Button(
             actions,
             text="Автонастройка",
             command=self.auto_start,
@@ -50,15 +67,80 @@ class SpinParameters(ttk.Frame):
         self.auto_button.pack(side="left")
         add_tooltip(
             self.auto_button,
-            "Оценить стартовый порог, ширины и параметры линии по области. Затем проверьте подгонку.",
+            lambda: (
+                "Оценить стартовые параметры по области текущего спектра. Затем проверьте подгонку."
+                + (
+                    f" Пересчёт относится ко всей серии: {self.operation_scope_size} спектров."
+                    if self.operation_scope_size > 1
+                    else ""
+                )
+            ),
         )
-        ttk.Label(
+        self.wheel_hint = ttk.Label(
             actions, text="Колесо / ↑↓: шаг\nShift: точно · Ctrl: крупно", foreground="#666666"
-        ).pack(side="left", padx=10)
-        self.feedback = tk.StringVar()
+        )
+        self.wheel_hint.pack(side="left", padx=10)
+        self.simple_panel = ttk.Frame(body)
+        self.simple_panel.pack(fill="both", expand=True, pady=(12, 0))
         ttk.Label(
+            self.simple_panel,
+            text="1. Подберите модель",
+            font="AppHeadingFont",
+        ).pack(anchor="w")
+        ttk.Label(
+            self.simple_panel,
+            text="Нажмите «Автонастройка» и проверьте\nсовпадение модели со спектром справа.",
+            justify="left",
+            foreground="#666666",
+            wraplength=280,
+        ).pack(anchor="w", pady=(4, 14))
+        ttk.Label(self.simple_panel, text="Форма линии").pack(anchor="w")
+        # Bound to the same variable as the expert control below. Switching
+        # presentation must never create a second recipe or trigger a refit.
+        self.simple_shape_box = ttk.Combobox(
+            self.simple_panel,
+            state="readonly",
+            values=tuple(SHAPE_LABELS.values()),
+        )
+        self.simple_shape_box.pack(fill="x", pady=(4, 12))
+        self.baseline_summary = tk.StringVar(self)
+        ttk.Label(
+            self.simple_panel,
+            textvariable=self.baseline_summary,
+            wraplength=280,
+            justify="left",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(0, 16))
+        for title, instruction in (
+            (
+                "2. Выберите сигналы",
+                "Клик по пунктирной линии выбирает её;\nповторный клик снимает выбор.\nМожно объединить несколько линий.",
+            ),
+            (
+                "3. Создайте интеграл",
+                "Дайте выбранным сигналам общее имя\nи нажмите «Создать из выбранного».",
+            ),
+        ):
+            ttk.Label(self.simple_panel, text=title, font="AppHeadingFont").pack(anchor="w")
+            ttk.Label(
+                self.simple_panel,
+                text=instruction,
+                wraplength=280,
+                justify="left",
+                foreground="#666666",
+            ).pack(anchor="w", pady=(4, 16))
+        ttk.Label(
+            self.simple_panel,
+            text="Ручные пороги, ширины и коррекция фона —\nв экспертном режиме. Текущая модель сохранится.",
+            wraplength=280,
+            justify="left",
+            foreground="#666666",
+        ).pack(anchor="w", pady=(4, 0))
+        self.feedback = tk.StringVar()
+        self.feedback_label = ttk.Label(
             body, textvariable=self.feedback, wraplength=430, foreground="#666666", justify="left"
-        ).pack(side="bottom", fill="x", pady=(4, 0))
+        )
+        self.feedback_label.pack(side="bottom", fill="x", pady=(4, 0))
         tabs = ttk.Notebook(body)
         self.tabs = tabs
         tabs.pack(fill="both", expand=True)
@@ -75,6 +157,10 @@ class SpinParameters(ttk.Frame):
             "fit.line_shape",
             SHAPE_LABELS[self.recipe["fit"]["line_shape"]],
             tuple(SHAPE_LABELS.values()),
+        )
+        self.simple_shape_box.configure(textvariable=self.vars["fit.line_shape"])
+        self.simple_shape_box.configure(
+            postcommand=lambda: fit_combobox_popup(self.simple_shape_box)
         )
         self.refine_centers = tk.BooleanVar(value=self.recipe["fit"]["refine_centers"])
         ttk.Checkbutton(model_tab, text="Уточнять центры линий", variable=self.refine_centers).grid(
@@ -149,16 +235,16 @@ class SpinParameters(ttk.Frame):
                 ("Метод", "method", core.BASELINE_METHODS),
                 ("Сглаживание λ", "lam", None),
                 ("Асимметрия p", "p", None),
-                ("Окно SNIP / mor, точки", "half_window", None),
+                ("Полуокно отсечения пиков, точки", "half_window", None),
                 ("Окно сглаживания, точки", "smooth_half_window", None),
                 ("Порядок полинома", "poly_order", None),
                 ("Лимит итераций", "max_iter", None),
-                ("Точность tol", "tol", None),
+                ("Точность сходимости", "tol", None),
             )
         ):
             self.field(
                 baseline_tab,
-                row,
+                row if row == 0 else row + 1,
                 label,
                 "baseline." + key,
                 self.recipe["baseline_default"][key],
@@ -170,18 +256,18 @@ class SpinParameters(ttk.Frame):
             "Сам исходный спектр и обычные интегралы не меняются.",
             wraplength=330,
             foreground="#68707d",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=12)
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=12)
         self.follow_nox = tk.BooleanVar(value=self.recipe.get("baseline_policy", "manual") == "nox")
         ttk.Checkbutton(
             baseline_tab, text="Учитывать коррекцию NOX автоматически", variable=self.follow_nox
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=4)
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=4)
         self.baseline_context_note = tk.StringVar()
         ttk.Label(
             baseline_tab,
             textvariable=self.baseline_context_note,
             wraplength=330,
             foreground="#68707d",
-        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=4)
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=4)
         for path, variable in self.vars.items():
             variable.trace_add("write", lambda *_, key=path: self.parameter_changed(key))
         for variable in (self.signed, self.auto_threshold, self.refine_centers):
@@ -189,6 +275,36 @@ class SpinParameters(ttk.Frame):
         self.follow_nox.trace_add("write", lambda *_: self.parameter_changed("baseline_policy"))
         for page in self.pages:
             page.bind_scrolling()
+        self.mode.trace_add("write", self._mode_changed)
+        self.update_baseline_context()
+        self._mode_changed(notify=False)
+
+    def set_mode(self, mode):
+        """Choose presentation only; parameter values and fit history stay intact."""
+        if mode not in ("ordinary", "expert"):
+            raise ValueError(f"Unknown Spintegrate parameter mode: {mode}")
+        if self.mode.get() != mode:
+            self.mode.set(mode)
+
+    def _mode_changed(self, *_, notify=True):
+        mode = self.mode.get()
+        if mode not in ("ordinary", "expert"):
+            mode = "ordinary"
+            self.mode.set(mode)
+        if mode == "expert":
+            self.feedback_label.configure(wraplength=360)
+            self.simple_panel.pack_forget()
+            self.tabs.pack(fill="both", expand=True)
+            self.wheel_hint.pack(side="left", padx=10)
+        else:
+            self.feedback_label.configure(wraplength=280)
+            self.tabs.pack_forget()
+            self.wheel_hint.pack_forget()
+            self.simple_panel.pack(fill="both", expand=True, pady=(12, 0))
+        if notify and self.on_mode_change:
+            self.on_mode_change(mode)
+        if notify:
+            self.event_generate("<<SpinModeChanged>>", when="tail")
 
     def field(self, parent, row, label, key, value, choices=None):
         variable = tk.StringVar(value=f"{value:.8g}" if isinstance(value, float) else str(value))
@@ -198,9 +314,34 @@ class SpinParameters(ttk.Frame):
             row=row, column=0, sticky="w", padx=(0, 8), pady=3
         )
         if choices:
+            display = variable
+            if key == "baseline.method":
+                self.baseline_display = display = tk.StringVar(
+                    value=EXTENDED_METHODS[variable.get()]
+                )
+                choices = tuple(EXTENDED_METHODS[method] for method in choices)
+                variable.trace_add(
+                    "write", lambda *_: display.set(EXTENDED_METHODS[variable.get()])
+                )
+                ttk.Label(parent, textvariable=display, wraplength=330, foreground="#68707d").grid(
+                    row=row + 1, column=0, columnspan=2, sticky="w", pady=(2, 6)
+                )
             widget = ttk.Combobox(
-                parent, textvariable=variable, values=choices, state="readonly", width=16
+                parent, textvariable=display, values=choices, state="readonly", width=16
             )
+            if key == "baseline.method":
+                self.baseline_method_box = widget
+                widget.configure(postcommand=lambda: fit_combobox_popup(widget))
+                widget.bind(
+                    "<<ComboboxSelected>>",
+                    lambda _: variable.set(
+                        next(
+                            method
+                            for method, label in EXTENDED_METHODS.items()
+                            if label == display.get()
+                        )
+                    ),
+                )
         else:
             widget = ttk.Frame(parent)
             entry = ttk.Entry(widget, textvariable=variable, width=10)
@@ -250,12 +391,18 @@ class SpinParameters(ttk.Frame):
         self.update_baseline_context()
 
     def update_baseline_context(self):
+        method = self.vars["baseline.method"].get()
         if self._baseline_context is None:
+            self.baseline_summary.set(
+                "Базовая линия: автоматически с учётом NOX."
+                if self.follow_nox.get()
+                else "Базовая линия: " + EXTENDED_METHODS[method] + "."
+            )
             return
         record, low, high, offset = self._baseline_context
         corrected = corrected_region(record, low, high, offset)
         self.baseline_context_note.set(
-            "Фон уже вычтен в NOX на этой области → none, без повторного вычитания."
+            "Фон уже вычтен в NOX на этой области → без коррекции базовой линии."
             if corrected and self.follow_nox.get()
             else "Фон уже вычтен в NOX. Локальный метод выбран вручную."
             if corrected
@@ -269,6 +416,12 @@ class SpinParameters(ttk.Frame):
                 self.vars["baseline.method"].set(resolved["baseline_default"]["method"])
             finally:
                 self._updating = False
+            method = self.vars["baseline.method"].get()
+        self.baseline_summary.set(
+            "Фон уже вычтен в NOX.\nПовторно не вычитается."
+            if corrected and self.follow_nox.get()
+            else "Локальная базовая линия:\n" + EXTENDED_METHODS[method] + "."
+        )
 
     def nudge(self, path, direction, event=None):
         state = getattr(event, "state", 0)

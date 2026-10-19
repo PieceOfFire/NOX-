@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 import traceback
 
 STAGES = (
@@ -73,12 +74,15 @@ class SplashProcess:
             process.wait(timeout=2)
 
 
-def load_application(progress):
+def load_application(progress, *, timing=None):
     """Stage markers describe actual imports, not an estimated time percentage."""
     application = None
     for index, (module, label) in enumerate(STAGES):
         progress.update(label, index)
+        started = time.perf_counter()
         application = importlib.import_module(module)
+        if timing is not None:
+            timing(module, time.perf_counter() - started)
     progress.update("Создание рабочего окна…", len(STAGES))
     return application.HimeraApp
 
@@ -102,16 +106,35 @@ def show_startup_error(error):
         pass  # The original traceback remains available in the terminal.
 
 
-def launch():
+def launch(*, timing=False):
+    """Launch normally; optional console timings contain no spectrum/user data."""
+    started = time.perf_counter()
+
+    def report(stage, elapsed):
+        if timing:
+            print(f"[startup] {stage}: {elapsed:.3f} s", flush=True)
+
+    if timing:
+        print("[startup] Begin", flush=True)
     splash = SplashProcess()
+    report("splash process", time.perf_counter() - started)
     application = None
     try:
-        application_class = load_application(splash)
+        application_class = (
+            load_application(splash, timing=report) if timing else load_application(splash)
+        )
+        step_started = time.perf_counter()
         application = application_class()
+        report("window construction", time.perf_counter() - step_started)
         # Complete initial layout and the first plot before removing the splash.
+        step_started = time.perf_counter()
         application.update_idletasks()
+        report("first layout", time.perf_counter() - step_started)
         splash.update("Всё готово", len(STAGES) + 1)
+        step_started = time.perf_counter()
         splash.close()
+        report("splash cleanup", time.perf_counter() - step_started)
+        report("ready total", time.perf_counter() - started)
     except StartupCancelled:
         if application is not None:
             application.destroy()

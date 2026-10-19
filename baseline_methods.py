@@ -4,18 +4,23 @@ import numpy as np
 from base_line import peak_polarity
 
 QUICK_METHODS = ("Адаптивный arPLS", "Фильтр Уиттакера", "Сглаживающий spline")
+QUICK_LABELS = {
+    "Адаптивный arPLS": "Адаптивная робастная коррекция базовой линии",
+    "Фильтр Уиттакера": "Фильтр Уиттакера",
+    "Сглаживающий spline": "Сглаживающий сплайн",
+}
 MORE_OPTIONS = "More options…"
 EXTENDED_METHODS = {
-    "asls": "AsLS — асимметричное сглаживание",
-    "arpls": "arPLS — робастное сглаживание (Spintegrate)",
-    "airpls": "airPLS — итеративное сглаживание",
-    "drpls": "drPLS — двойное взвешивание",
-    "iasls": "IAsLS — улучшенный AsLS",
-    "snip": "SNIP — отсечение пиков",
-    "modpoly": "ModPoly — полиномиальный фон",
-    "imodpoly": "IModPoly — улучшенный полином",
-    "mor": "MOR — морфологический фон",
-    "none": "none — без коррекции",
+    "asls": "Asymmetric Least Squares",
+    "arpls": "Asymmetrically Reweighted Penalized Least Squares",
+    "airpls": "Adaptive Iteratively Reweighted Penalized Least Squares",
+    "drpls": "Doubly Reweighted Penalized Least Squares",
+    "iasls": "Improved Asymmetric Least Squares",
+    "snip": "Statistics-sensitive Non-linear Iterative Peak-clipping",
+    "modpoly": "Modified Polynomial",
+    "imodpoly": "Improved Modified Polynomial",
+    "mor": "Morphological",
+    "none": "Без коррекции базовой линии",
 }
 FIELDS = {
     "lam": ("Сглаживание λ", 1e6),
@@ -46,7 +51,7 @@ def core_method(method):
 
 
 def method_label(method):
-    return EXTENDED_METHODS.get(core_method(method), method)
+    return EXTENDED_METHODS.get(core_method(method), QUICK_LABELS.get(method, method))
 
 
 def validate_settings(method, parameters=None):

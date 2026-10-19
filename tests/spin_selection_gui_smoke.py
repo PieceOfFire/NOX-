@@ -53,8 +53,8 @@ def main():
             w.plot_mode.set("region")
             w.set_selection_mode()
             assert len(w.group_specs) == 1
-            assert w.tables.tab(w.lines_tab, "text") == "Линии модели (2)"
-            assert w.tables.tab(w.output_tab, "text") == "Итоговые интегралы (1)"
+            assert w.tables.tab(w.lines_tab, "text") == "Линии (2)"
+            assert w.tables.tab(w.output_tab, "text") == "Интегралы (1)"
             assert w.groups.winfo_height() > 70
             drag(w, 3.49, 3.51)
             assert w.selected_indices() == [0]

@@ -11,7 +11,9 @@ from ui_theme import (
     MUTED,
     BORDER,
     GRID,
-    ACTIVE,
+    BUTTON_SURFACE,
+    BUTTON_HOVER,
+    BUTTON_PRESSED,
     ERROR,
     WARNING,
     SUCCESS,
@@ -323,8 +325,10 @@ class FormulaEditor(tk.Toplevel):
         self.make_formula_button(header, "Новая", self.new_formula, variant="dark").pack(
             side="right", padx=(0, 6)
         )
-        self.formula_status = self.app.formula_status
-        self.formula_status.set("Нажмите блок в библиотеке, соедините порты и добавьте результат.")
+        self.formula_status = tk.StringVar(
+            master=self,
+            value="Нажмите блок в библиотеке, соедините порты и добавьте результат.",
+        )
         layout = tk.Frame(self.formula_tab, bg=PAGE, padx=10, pady=8)
 
         palette = tk.LabelFrame(
@@ -394,8 +398,8 @@ class FormulaEditor(tk.Toplevel):
                 relief="raised",
                 bd=1,
                 font=("Segoe UI Symbol", 10, "bold"),
-                bg=self.formula_theme["toolbar"],
-                activebackground=ACTIVE,
+                bg=BUTTON_SURFACE,
+                activebackground=BUTTON_HOVER,
                 fg=TEXT,
                 command=lambda value=tool: self.set_formula_tool(value),
             )
@@ -694,7 +698,7 @@ class FormulaEditor(tk.Toplevel):
         for name, button in getattr(self, "formula_tool_buttons", {}).items():
             button.configure(
                 relief="sunken" if name == tool else "raised",
-                bg=ACTIVE if name == tool else PAGE,
+                bg=BUTTON_PRESSED if name == tool else BUTTON_SURFACE,
                 fg=TEXT,
             )
         if hasattr(self, "formula_status"):

@@ -27,6 +27,43 @@ def test_importing_entry_point_does_not_import_scientific_stack():
     assert result.returncode == 0, result.stderr
 
 
+def test_importing_application_defers_optional_numerical_engines():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from main import SpectrumApp; "
+            "assert SpectrumApp.__name__ == 'HimeraApp'; "
+            "assert not {'scipy', 'nmrglue', 'pybaselines', 'spintegrate.core', "
+            "'integral_stability', 'integral_stability_view'} & sys.modules.keys()",
+        ],
+        cwd=Path(startup.__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_matching_still_loads_scipy_on_demand():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from spin_groups import component_matches; "
+            "assert component_matches([], [1], .2) == {}; "
+            "assert 'scipy' not in sys.modules; "
+            "assert component_matches([1, 2], [2.1, 1.1], .2) == {0: 1, 1: 0}; "
+            "assert 'scipy.optimize' in sys.modules",
+        ],
+        cwd=Path(startup.__file__).parent,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 class FakeSplash:
     def __init__(self):
         self.updates = []
@@ -41,6 +78,7 @@ class FakeSplash:
 
 def test_stage_markers_follow_real_imports():
     events = []
+    timings = []
     splash = FakeSplash()
     factory = object()
 
@@ -50,12 +88,15 @@ def test_stage_markers_follow_real_imports():
         return SimpleNamespace(HimeraApp=factory)
 
     with patch.object(startup.importlib, "import_module", side_effect=load):
-        assert startup.load_application(splash) is factory
+        assert startup.load_application(splash, timing=lambda *args: timings.append(args)) is factory
     assert events == [stage[0] for stage in startup.STAGES]
     assert [n for _, n in splash.updates] == list(range(5))
+    assert [name for name, _ in timings] == events
+    assert all(elapsed >= 0 for _, elapsed in timings)
 
 
-def test_splash_outlives_construction_and_first_layout():
+@pytest.mark.parametrize("timing", [False, True])
+def test_splash_outlives_construction_and_first_layout(timing, capsys):
     splash = FakeSplash()
     events = []
 
@@ -76,8 +117,16 @@ def test_splash_outlives_construction_and_first_layout():
         patch.object(startup, "SplashProcess", return_value=splash),
         patch.object(startup, "load_application", return_value=Application),
     ):
-        assert startup.launch() == 0
+        assert startup.launch(timing=timing) == 0
     assert events == ["created", "drawn", "mainloop"]
+    output = capsys.readouterr().out
+    if timing:
+        assert "[startup] Begin" in output
+        assert "[startup] window construction:" in output
+        assert "[startup] first layout:" in output
+        assert "[startup] ready total:" in output
+    else:
+        assert not output
 
 
 @pytest.mark.parametrize(

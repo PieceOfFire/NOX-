@@ -219,17 +219,49 @@ def apply_baseline_steps(record, steps, *, strength=1.0):
     return signal if steps else None
 
 
-def apply_template(record, template, *, align=True, auto_phase=False):
+def _validate_target(record):
+    """Reject incompatible inputs before doing expensive or partial processing."""
+    ppm = np.asarray(record["ppm"], dtype=float)
+    real = np.asarray(record["real"], dtype=float)
+    imaginary = np.asarray(record["imaginary"], dtype=float)
+    if (
+        ppm.ndim != 1 or len(ppm) < 8
+        or real.shape != ppm.shape or imaginary.shape != ppm.shape
+        or not all(np.isfinite(values).all() for values in (ppm, real, imaginary))
+        or not (np.all(np.diff(ppm) > 0) or np.all(np.diff(ppm) < 0))
+    ):
+        raise ValueError("Некорректные данные спектра: нужны согласованные 1r, 1i и шкала ppm.")
+    if not all(np.isfinite(float(record.get(key, default))) for key, default in (
+        ("phase0", 0), ("phase1", 0), ("phase_pivot", .5),
+    )):
+        raise ValueError("Фаза спектра должна быть конечным числом.")
+    return ppm
+
+
+def apply_template(
+    record, template, *, align=True, auto_phase=False,
+    phase_mode="template", allow_incomplete=False,
+):
+    """Replay a recipe on independent data, never accumulating a previous baseline.
+
+    ``phase_mode='preserve'`` is the manual-series path: only the operator sets
+    phase. The legacy default still copies template phase. Incomplete Spintegrate
+    assignments can be returned for editing, but remain missing (NaN), never zero.
+    """
     template = validate_template(template)
+    if phase_mode not in ("template", "preserve"):
+        raise ValueError("Неизвестный режим фазы шаблона.")
+    if phase_mode == "preserve" and auto_phase:
+        raise ValueError("Ручная фаза несовместима с автоматическим фазированием.")
+    _validate_target(record)
     result = copy.deepcopy(record)
     phase = template["phase"]
-    result.update(
-        phase0=phase["phase0"],
-        phase1=phase["phase1"],
-        phase_pivot=phase["pivot"],
-        corrected=None,
-        phase_reference=None,
-    )
+    result["corrected"] = None
+    if phase_mode == "template":
+        result.update(
+            phase0=phase["phase0"], phase1=phase["phase1"],
+            phase_pivot=phase["pivot"], phase_reference=None,
+        )
     if auto_phase:
         p0, p1, reliable = auto_phase_parameters(
             result["real"], result["imaginary"], pivot=phase["pivot"], return_reliable=True
@@ -250,6 +282,16 @@ def apply_template(record, template, *, align=True, auto_phase=False):
         shift, correlation = aligned.shift, aligned.correlation
         result["ppm"] = np.asarray(result["ppm"]) + shift
         result["ppm_shift"] = float(result.get("ppm_shift", 0)) + shift
+    warnings, incomplete_fits = [], []
+    ppm = np.asarray(result["ppm"])
+    for item in template["integrals"]:
+        if item["left"] < ppm.min() or item["right"] > ppm.max():
+            raise ValueError(f"Интеграл I{item['number']} выходит за пределы спектра.")
+        if np.count_nonzero((ppm >= item["left"]) & (ppm <= item["right"])) < 2:
+            raise ValueError(f"В интеграле I{item['number']} меньше двух точек спектра.")
+    for fid, fit in template["fits"].items():
+        if fit["low"] < ppm.min() or fit["high"] > ppm.max():
+            raise ValueError(f"Область Spintegrate {fid} выходит за пределы спектра.")
     result["baseline_steps"] = copy.deepcopy(template["baseline_steps"])
     result["baseline_source_unknown"] = False
     result["corrected"] = apply_baseline_steps(result, result["baseline_steps"])
@@ -272,9 +314,23 @@ def apply_template(record, template, *, align=True, auto_phase=False):
             group["components"] = [matches[i] for i in old if i in matches]
             group["missing"] = sum(i not in matches for i in old)
         refresh_automatic_groups(state["groups"], len(model["centers"]))
+        if allow_incomplete and not len(model["centers"]):
+            # A vanished dynamic whole-area signal needs an explicit operator
+            # acknowledgement, just like a vanished named chemical group.
+            for group, original in zip(state["groups"], fit["groups"]):
+                if group.get("automatic") and original["components"]:
+                    group.update(automatic=False, missing=len(original["components"]))
         validate_groups(state)
-        if any(g["missing"] for g in state["groups"]):
-            raise ValueError("Не все линии группы найдены: требуется ручная проверка Spintegrate.")
+        missing_groups = [g for g in state["groups"] if g.get("missing", 0)]
+        if missing_groups:
+            if not allow_incomplete:
+                raise ValueError("Не все линии группы найдены: требуется ручная проверка Spintegrate.")
+            incomplete_fits.append(fid)
+            warnings.extend(
+                f"Spintegrate «{group['name']}»: потеряно линий {group['missing']}; "
+                "площадь недоступна до проверки состава."
+                for group in missing_groups
+            )
         result["spin_analyses"][fid] = state
         result["last_spin_fit"] = fid
     for item in result["integrals"]:
@@ -284,4 +340,7 @@ def apply_template(record, template, *, align=True, auto_phase=False):
     result["reference_integral_id"] = None
     result["integration_method"] = template["integration_method"]
     result["integration_display"] = template["integration_display"]
-    return result, dict(shift=shift, correlation=correlation)
+    return result, dict(
+        shift=shift, correlation=correlation, warnings=warnings,
+        incomplete_fits=incomplete_fits, phase_mode=phase_mode,
+    )

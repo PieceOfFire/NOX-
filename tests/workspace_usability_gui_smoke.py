@@ -135,6 +135,8 @@ def main():
             assert not w.states[sid]["groups"][0].get("line_shape")
             w.history_key(SimpleNamespace(keysym="Cyrillic_ya", keycode=90, state=5))
             assert same_state(w.states, fitted)
+            w.parameters.set_mode("expert")
+            app.update()
             parameter_entry = w.parameters.entries["fit.threshold"]
             parameter_entry.focus_force()
             app.update()
